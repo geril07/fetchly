@@ -277,7 +277,7 @@ push to main
   → GitHub Actions
     → cargo test
     → docker build
-    → push to ghcr.io/geril/fetchly:latest
+    → push to ghcr.io/geril07/fetchly:latest
     → SSH into server
     → docker compose pull && docker compose up -d
 ```
@@ -365,7 +365,7 @@ Server uses `image:` instead of `build:`:
 ```yaml
 services:
   bot:
-    image: ghcr.io/geril/fetchly:latest
+    image: ghcr.io/geril07/fetchly:latest
     env_file: .env
     volumes:
       - db:/data
@@ -407,7 +407,7 @@ Server-side compose sets the grace period:
 ```yaml
 services:
   bot:
-    image: ghcr.io/geril/fetchly:latest
+    image: ghcr.io/geril07/fetchly:latest
     stop_grace_period: 120s
     ...
 ```
