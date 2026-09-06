@@ -52,10 +52,14 @@ impl Error {
     #[must_use]
     pub fn user_message(&self) -> String {
         match self {
-            Self::UnsupportedUrl
-            | Self::PrivateOrRestricted
-            | Self::TooLarge
-            | Self::SessionExpired => self.to_string(),
+            // Explicit sentence-case copy (matches docs/v1-spec.md).
+            // The `Display` strings stay lowercase for log lines.
+            Self::UnsupportedUrl => {
+                "Unsupported link. Send a YouTube, TikTok, Instagram, or X URL.".to_owned()
+            }
+            Self::PrivateOrRestricted => "This content is private or restricted.".to_owned(),
+            Self::TooLarge => "File exceeds 2 GB limit. Try lower quality.".to_owned(),
+            Self::SessionExpired => "Session expired. Send the link again.".to_owned(),
             Self::Cancelled => "Cancelled.".to_owned(),
             Self::RateLimited {
                 retry_in_secs,
@@ -91,3 +95,62 @@ impl From<rusqlite::Error> for Error {
 
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_messages_are_safe_to_send() {
+        // Raw tool/DB details must never leak into chat.
+        let cases: Vec<(Error, &str)> = vec![
+            (
+                Error::UnsupportedUrl,
+                "Unsupported link. Send a YouTube, TikTok, Instagram, or X URL.",
+            ),
+            (
+                Error::PrivateOrRestricted,
+                "This content is private or restricted.",
+            ),
+            (
+                Error::TooLarge,
+                "File exceeds 2 GB limit. Try lower quality.",
+            ),
+            (
+                Error::SessionExpired,
+                "Session expired. Send the link again.",
+            ),
+            (Error::Cancelled, "Cancelled."),
+            (
+                Error::RateLimited {
+                    retry_in_secs: 42,
+                    remaining: 0,
+                },
+                "Too many requests. Try again in 42 seconds.",
+            ),
+            (
+                Error::Download("yt-dlp: exit 1, SIGNAL 9".to_owned()),
+                "Download failed. Try again later.",
+            ),
+            (
+                Error::Convert("ffmpeg: invalid data".to_owned()),
+                "Download failed. Try again later.",
+            ),
+            (
+                Error::Resolve("socket timeout".to_owned()),
+                "Could not fetch this link. Try again later.",
+            ),
+            (
+                Error::Telegram("Bad Request: file too big".to_owned()),
+                "Something went wrong. Try again later.",
+            ),
+            (
+                Error::Cache("sqlite: disk I/O error".to_owned()),
+                "Something went wrong. Try again later.",
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.user_message(), want, "{err:?}");
+        }
+    }
+}

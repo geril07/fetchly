@@ -98,14 +98,6 @@ pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<(
 
     let media = match url::parse(&raw_url) {
         Ok(m) => m,
-        Err(Error::UnsupportedUrl) => {
-            bot.send_message(
-                msg.chat.id,
-                "Unsupported link. Send a YouTube, TikTok, Instagram, or X URL.",
-            )
-            .await?;
-            return Ok(());
-        }
         Err(e) => {
             bot.send_message(msg.chat.id, e.user_message()).await?;
             return Ok(());
@@ -187,13 +179,14 @@ async fn fetch_bytes(
 }
 
 /// First URL-like token in free text.
-fn extract_url(text: &str) -> Option<String> {
+///
+/// Leading `<` / trailing `>` wrapping (some clients autolink that way) is
+/// stripped before the scheme check.
+pub(crate) fn extract_url(text: &str) -> Option<String> {
     text.split_whitespace()
-        .map(str::trim)
+        .map(|t| t.trim().trim_matches(|c| c == '<' || c == '>'))
         .find(|t| t.starts_with("http://") || t.starts_with("https://"))
         .map(str::to_owned)
-        // Handle `<url>` wrapping from some clients.
-        .map(|u| u.trim_matches(|c| c == '<' || c == '>').to_owned())
 }
 
 /// Entry point for all callback queries.
@@ -739,4 +732,41 @@ pub fn schema() -> teloxide::dispatching::UpdateHandler<Error> {
             tracing::debug!("unhandled update: {:?}", upd.kind);
             Ok(())
         }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_first_url() {
+        assert_eq!(
+            extract_url("check this https://youtu.be/abc and https://x.com/1"),
+            Some("https://youtu.be/abc".to_owned())
+        );
+        assert_eq!(
+            extract_url("https://vm.tiktok.com/xyz/"),
+            Some("https://vm.tiktok.com/xyz/".to_owned())
+        );
+    }
+
+    #[test]
+    fn extracts_wrapped_and_prefixed_urls() {
+        assert_eq!(
+            extract_url("watch <https://youtu.be/abc>"),
+            Some("https://youtu.be/abc".to_owned())
+        );
+        assert_eq!(
+            extract_url("hey,https://x.com/a"),
+            None,
+            "URL glued to text is not a token"
+        );
+    }
+
+    #[test]
+    fn no_url_yields_none() {
+        assert_eq!(extract_url("just some words"), None);
+        assert_eq!(extract_url(""), None);
+        assert_eq!(extract_url("/start"), None);
+    }
 }

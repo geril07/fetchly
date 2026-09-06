@@ -195,4 +195,33 @@ mod tests {
             "⬇️ Downloading ████████░░ 80%"
         );
     }
+
+    #[test]
+    fn views_format() {
+        assert_eq!(format_views(999), "999 views");
+        assert_eq!(format_views(1_000), "1.0K views");
+        assert_eq!(format_views(12_345), "12.3K views");
+        assert_eq!(format_views(1_000_000), "1.0M views");
+        assert_eq!(format_views(1_500_000), "1.5M views");
+    }
+
+    #[test]
+    fn preview_card_text() {
+        let text = preview_text(&meta());
+        assert!(text.starts_with("T\n"), "{text}");
+        assert!(text.contains("1:00"), "{text}");
+        assert!(text.contains("YouTube"), "{text}");
+        assert!(text.contains("1.5M views"), "{text}");
+    }
+
+    #[test]
+    fn preview_escapes_html() {
+        let mut m = meta();
+        m.title = "A<B>&\"C\"".to_owned();
+        m.view_count = None;
+        m.uploader = None;
+        let text = preview_text(&m);
+        assert!(text.contains("A&lt;B&gt;&amp;"), "{text}");
+        assert!(!text.contains("views"), "{text}");
+    }
 }

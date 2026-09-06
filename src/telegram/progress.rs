@@ -3,9 +3,23 @@ use std::time::{Duration, Instant};
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, MessageId};
 
-/// Throttled progress editor: at most one `editMessageText` per 3 s
-/// (Telegram per-chat limit is ~1 msg/s; 3 s keeps us far below it while
-/// still feeling live). The final 100% update always goes through.
+/// Minimum time between `editMessageText` calls (Telegram per-chat limit is
+/// ~1 msg/s; 3 s keeps us far below it while still feeling live).
+const EDIT_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Pure throttle decision, extracted for tests.
+fn should_edit(last_edit: Option<Instant>, now: Instant, text_changed: bool, force: bool) -> bool {
+    if force {
+        return true;
+    }
+    if !text_changed {
+        return false;
+    }
+    last_edit.is_none_or(|t| now.duration_since(t) >= EDIT_INTERVAL)
+}
+
+/// Throttled progress editor: at most one `editMessageText` per [`EDIT_INTERVAL`].
+/// The final 100% update always goes through (`force=true`).
 pub struct Progress {
     bot: Bot,
     chat: ChatId,
@@ -28,13 +42,12 @@ impl Progress {
     /// Edit the message if `text` changed and the throttle window elapsed.
     /// Set `force=true` for the final update.
     pub async fn update(&mut self, text: &str, force: bool) {
-        if text == self.last_text && !force {
-            return;
-        }
-        let due = self
-            .last_edit
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(3));
-        if !due && !force {
+        if !should_edit(
+            self.last_edit,
+            Instant::now(),
+            text != self.last_text,
+            force,
+        ) {
             return;
         }
         if self
@@ -51,8 +64,28 @@ impl Progress {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
-    fn throttle_window_is_3s() {
-        assert_eq!(std::time::Duration::from_secs(3).as_secs(), 3);
+    fn first_edit_always_allowed() {
+        assert!(should_edit(None, Instant::now(), true, false));
+    }
+
+    #[test]
+    fn unchanged_text_suppressed_unless_forced() {
+        let now = Instant::now();
+        assert!(!should_edit(None, now, false, false));
+        assert!(should_edit(None, now, false, true));
+    }
+
+    #[test]
+    fn throttle_window_respected() {
+        let base = Instant::now();
+        let recent = base.checked_sub(Duration::from_secs(1));
+        let old = base.checked_sub(Duration::from_secs(4));
+        assert!(!should_edit(recent, base, true, false));
+        assert!(should_edit(old, base, true, false));
+        // Forced final update bypasses the window.
+        assert!(should_edit(recent, base, true, true));
     }
 }
