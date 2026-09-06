@@ -178,17 +178,28 @@ fetchly/
 Multi-stage build:
 
 ```
-Stage 1 — builder
-  rust:1.98-trixie
-  cargo build --release
+Stage 0 — chef
+  rust:1.98-trixie + cargo install cargo-chef
 
-Stage 2 — runtime
+Stage 1 — planner
+  dependency snapshot (recipe.json) from manifests + sources
+
+Stage 2 — builder
+  cargo chef cook --release (third-party deps, cached until manifests change)
+  cargo build --release (only our crate rebuilds on source changes)
+
+Stage 3 — runtime
   debian:trixie-slim
   apt install: ca-certificates, curl, ffmpeg
   yt-dlp standalone binary from GitHub releases
   copy binary from builder
   ENTRYPOINT ["./fetchly"]
 ```
+
+Do not replace this with the dummy-`main.rs` warmup trick: `COPY` preserves
+old host mtimes, cargo then considers the crate fresh and ships the dummy
+binary (silent exit 0, no logs — observed September 2026). `cargo-chef`
+exists precisely to avoid that class of bug.
 
 Pinned September 2026. `bookworm` is oldstable (Debian 13 `trixie` is stable).
 yt-dlp comes as the standalone `yt-dlp_linux` binary (bundles its own Python):

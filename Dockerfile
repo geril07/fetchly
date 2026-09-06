@@ -1,16 +1,23 @@
-# ---- Stage 1: builder ----
-FROM rust:1.98-trixie AS builder
+# ---- Stage 0: cargo-chef tool ----
+FROM rust:1.98-trixie AS chef
+RUN cargo install cargo-chef
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
-# Cache deps first (dummy main to warm the registry).
-RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && cargo build --release || true
-COPY src ./src
-# COPY preserves host mtimes, which predate the warmup artifacts above.
-# Cargo trusts mtimes (older sources = "fresh") and would skip the rebuild,
-# shipping the dummy binary — so bump mtimes to force a real rebuild.
-RUN find src -name '*.rs' -exec touch {} + && cargo build --release
 
-# ---- Stage 2: runtime ----
+# ---- Stage 1: planner — dependency snapshot (cheap, reruns on manifest change) ----
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---- Stage 2: builder — cached deps, then the real build ----
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release
+
+# ---- Stage 3: runtime ----
 FROM debian:trixie-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
