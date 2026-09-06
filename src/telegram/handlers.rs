@@ -1,0 +1,742 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use teloxide::prelude::*;
+use teloxide::types::{
+    CallbackQuery, ChatId, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode,
+};
+use teloxide::utils::command::BotCommands;
+use tokio_util::sync::CancellationToken;
+
+use crate::cache::FileCache;
+use crate::config::Config;
+use crate::error::{Error, Result};
+use crate::limiter::RateLimiter;
+use crate::media::url;
+use crate::media::ytdlp::{self, AudioQuality, VideoQuality};
+use crate::session::{SessionStore, StoredSession};
+use crate::telegram::keyboard::{self, format_bytes};
+
+/// Shared state injected into every handler via `dptree::deps!`.
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Config,
+    pub cache: FileCache,
+    pub sessions: SessionStore,
+    pub limiter: RateLimiter,
+    pub semaphore: Arc<tokio::sync::Semaphore>,
+    /// In-flight downloads: `session_id` → cancel token (wired to ❌ button).
+    pub downloads: Arc<tokio::sync::Mutex<HashMap<String, CancellationToken>>>,
+    pub http: reqwest::Client,
+}
+
+impl AppState {
+    #[must_use]
+    pub fn new(
+        config: Config,
+        cache: FileCache,
+        sessions: SessionStore,
+        limiter: RateLimiter,
+        semaphore: Arc<tokio::sync::Semaphore>,
+        http: reqwest::Client,
+    ) -> Self {
+        Self {
+            config,
+            cache,
+            sessions,
+            limiter,
+            semaphore,
+            downloads: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            http,
+        }
+    }
+}
+
+#[derive(BotCommands, Clone)]
+#[command(rename_rule = "lowercase")]
+enum Command {
+    Start,
+    Help,
+}
+
+const WELCOME: &str =
+    "Send me a YouTube, TikTok, Instagram, or X link and I'll fetch the video or audio for you.";
+const HELP: &str = "Send a link → tap 🎬 Video or 🎵 Audio → pick quality.\n\nCommands:\n/start — welcome\n/help — this guide\n\nLimits: 20 downloads/hour, 2 GB max file size.";
+
+/// Entry point for text messages.
+pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
+    let Some(text) = msg.text() else {
+        return Ok(());
+    };
+
+    if let Ok(cmd) = Command::parse(text, "fetchly") {
+        let reply = match cmd {
+            Command::Start => WELCOME,
+            Command::Help => HELP,
+        };
+        bot.send_message(msg.chat.id, reply).await?;
+        return Ok(());
+    }
+    // Also handle bare `/start`/`/help` with bot username suffix.
+    if text.starts_with("/start") {
+        bot.send_message(msg.chat.id, WELCOME).await?;
+        return Ok(());
+    }
+    if text.starts_with("/help") {
+        bot.send_message(msg.chat.id, HELP).await?;
+        return Ok(());
+    }
+
+    let Some(raw_url) = extract_url(text) else {
+        bot.send_message(
+            msg.chat.id,
+            "Send a link and I'll fetch it. /help for details.",
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let media = match url::parse(&raw_url) {
+        Ok(m) => m,
+        Err(Error::UnsupportedUrl) => {
+            bot.send_message(
+                msg.chat.id,
+                "Unsupported link. Send a YouTube, TikTok, Instagram, or X URL.",
+            )
+            .await?;
+            return Ok(());
+        }
+        Err(e) => {
+            bot.send_message(msg.chat.id, e.user_message()).await?;
+            return Ok(());
+        }
+    };
+
+    let status = bot.send_message(msg.chat.id, "🔍 Resolving link…").await?;
+    let meta = match ytdlp::resolve(&media).await {
+        Ok(m) => m,
+        Err(e) => {
+            bot.edit_message_text(msg.chat.id, status.id, e.user_message())
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let hash = url::url_hash(&media.url);
+    let session_id = match state.sessions.create(&hash, &media.url, &meta).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!("session create failed: {e}");
+            bot.edit_message_text(msg.chat.id, status.id, e.user_message())
+                .await?;
+            return Ok(());
+        }
+    };
+
+    let caption = keyboard::preview_text(&meta);
+    let markup = keyboard::preview_keyboard(&session_id);
+    // Delete the "resolving" placeholder, then send the preview card.
+    let _ = bot.delete_message(msg.chat.id, status.id).await;
+    send_preview(&bot, msg.chat.id, &meta, &caption, markup, &state.http).await?;
+    Ok(())
+}
+
+/// Send preview card: photo + caption when a thumbnail exists, else plain text.
+async fn send_preview(
+    bot: &Bot,
+    chat: ChatId,
+    meta: &ytdlp::Metadata,
+    caption: &str,
+    markup: InlineKeyboardMarkup,
+    http: &reqwest::Client,
+) -> Result<()> {
+    if let Some(thumb) = &meta.thumbnail_url {
+        if let Ok(bytes) = fetch_bytes(http, thumb).await {
+            if !bytes.is_empty() && bytes.len() < 5_000_000 {
+                let res = bot
+                    .send_photo(chat, InputFile::memory(bytes))
+                    .caption(caption)
+                    .parse_mode(ParseMode::Html)
+                    .reply_markup(markup.clone())
+                    .await;
+                if res.is_ok() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    bot.send_message(chat, caption)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(markup)
+        .await?;
+    Ok(())
+}
+
+async fn fetch_bytes(
+    http: &reqwest::Client,
+    url: &str,
+) -> std::result::Result<Vec<u8>, reqwest::Error> {
+    Ok(http
+        .get(url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await?
+        .bytes()
+        .await?
+        .to_vec())
+}
+
+/// First URL-like token in free text.
+fn extract_url(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(str::trim)
+        .find(|t| t.starts_with("http://") || t.starts_with("https://"))
+        .map(str::to_owned)
+        // Handle `<url>` wrapping from some clients.
+        .map(|u| u.trim_matches(|c| c == '<' || c == '>').to_owned())
+}
+
+/// Entry point for all callback queries.
+pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Result<()> {
+    let Some(data) = q.data.clone() else {
+        return Ok(());
+    };
+    let Some((chat, msg_id)) = callback_origin(&q) else {
+        return Ok(());
+    };
+    let user_id = q.from.id.0;
+
+    let Some((kind, quality, session_id)) = crate::session::parse_callback(&data) else {
+        bot.answer_callback_query(q.id)
+            .text("Outdated button. Send the link again.")
+            .await?;
+        return Ok(());
+    };
+
+    // ❌ Cancel: wired to the in-flight download token.
+    if data.starts_with("cancel:") {
+        let token = state.downloads.lock().await.remove(&session_id);
+        if let Some(t) = token {
+            t.cancel();
+            bot.answer_callback_query(q.id).text("Cancelling…").await?;
+        } else {
+            bot.answer_callback_query(q.id)
+                .text("Nothing to cancel.")
+                .await?;
+            let _ = state.sessions.delete(&session_id).await;
+            let _ = bot.edit_message_text(chat, msg_id, "Cancelled.").await;
+        }
+        return Ok(());
+    }
+
+    let Ok(session) = state.sessions.get(&session_id).await else {
+        bot.answer_callback_query(q.id)
+            .text("Session expired. Send the link again.")
+            .await?;
+        bot.edit_message_text(chat, msg_id, "Session expired. Send the link again.")
+            .await?;
+        return Ok(());
+    };
+
+    match (kind, quality.as_str()) {
+        ('v', "pick") => {
+            bot.answer_callback_query(q.id).await?;
+            bot.edit_message_reply_markup(chat, msg_id)
+                .reply_markup(keyboard::video_quality_keyboard(
+                    &session.metadata,
+                    &session_id,
+                ))
+                .await?;
+        }
+        ('a', "pick") => {
+            bot.answer_callback_query(q.id).await?;
+            bot.edit_message_reply_markup(chat, msg_id)
+                .reply_markup(keyboard::audio_quality_keyboard(
+                    &session.metadata,
+                    &session_id,
+                ))
+                .await?;
+        }
+        ('v', code) => {
+            let Some(quality) = VideoQuality::parse_code(code) else {
+                bot.answer_callback_query(q.id)
+                    .text("Unknown quality.")
+                    .await?;
+                return Ok(());
+            };
+            bot.answer_callback_query(q.id).await?;
+            run_video(
+                bot, chat, msg_id, user_id, session_id, session, quality, state,
+            )
+            .await;
+        }
+        ('a', code) => {
+            let Some(quality) = AudioQuality::parse_code(code) else {
+                bot.answer_callback_query(q.id)
+                    .text("Unknown quality.")
+                    .await?;
+                return Ok(());
+            };
+            bot.answer_callback_query(q.id).await?;
+            run_audio(
+                bot, chat, msg_id, user_id, session_id, session, quality, state,
+            )
+            .await;
+        }
+        _ => {
+            bot.answer_callback_query(q.id).await?;
+        }
+    }
+    Ok(())
+}
+
+fn callback_origin(q: &CallbackQuery) -> Option<(ChatId, MessageId)> {
+    match q.message.as_ref()? {
+        teloxide::types::MaybeInaccessibleMessage::Regular(m) => Some((m.chat.id, m.id)),
+        teloxide::types::MaybeInaccessibleMessage::Inaccessible(_) => None,
+    }
+}
+
+/// Forward 0–100 download progress to a throttled Telegram progress message.
+///
+/// `scale_to` reserves headroom for later stages: video scales to 100,
+/// audio to 80 (the last 20% of the bar is convert + upload).
+fn spawn_progress_forwarder(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<u8>,
+    bot: Bot,
+    chat: ChatId,
+    msg: MessageId,
+    prefix: &'static str,
+    scale_to: u8,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut progress = crate::telegram::progress::Progress::new(bot, chat, msg);
+        while let Some(pct) = rx.recv().await {
+            let scaled = u8::try_from(u16::from(pct) * u16::from(scale_to) / 100).unwrap_or(100);
+            progress
+                .update(&keyboard::progress_bar(prefix, scaled), false)
+                .await;
+        }
+    })
+}
+
+/// Attach `ID3` tags + cover art to a converted `MP3`.
+///
+/// Best-effort: tagging never fails the download, it only logs.
+async fn tag_downloaded_audio(
+    session: &StoredSession,
+    mp3_path: &std::path::Path,
+    quality_code: &str,
+) {
+    let cover = match &session.metadata.thumbnail_url {
+        Some(thumb) => crate::media::tag::fetch_cover(thumb).await,
+        None => None,
+    };
+    let (cover_bytes, cover_mime) = cover.map_or((None, None), |(b, m)| (Some(b), m));
+    let info = crate::media::tag::TagInfo {
+        title: session.metadata.title.clone(),
+        artist: session.metadata.uploader.clone(),
+        album: None,
+        year: None,
+        cover_bytes,
+        cover_mime,
+    };
+    if let Err(e) = crate::media::tag::tag_mp3(mp3_path, info).await {
+        tracing::warn!("tagging failed (non-fatal): {e}");
+    }
+    if let Ok(meta) = tokio::fs::metadata(mp3_path).await {
+        tracing::info!(
+            "audio ready: {} ({}), quality {quality_code}",
+            format_bytes(meta.len()),
+            session.metadata.title,
+        );
+    }
+}
+
+/// Acquire a download slot, telling the user they are queued when busy.
+async fn acquire_permit(
+    bot: &Bot,
+    chat: ChatId,
+    origin_msg: MessageId,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    if semaphore.available_permits() == 0 {
+        let _ = bot
+            .edit_message_text(
+                chat,
+                origin_msg,
+                "⏳ Queued… your download starts automatically.",
+            )
+            .await;
+    }
+    semaphore.clone().acquire_owned().await.ok()
+}
+
+/// Video download pipeline: rate limit → cache → semaphore → yt-dlp → upload.
+#[allow(clippy::too_many_arguments)]
+async fn run_video(
+    bot: Bot,
+    chat: ChatId,
+    origin_msg: MessageId,
+    user_id: u64,
+    session_id: String,
+    session: StoredSession,
+    quality: VideoQuality,
+    state: AppState,
+) {
+    let quality_code = quality.as_str().to_owned();
+
+    if let Err(e) = state.limiter.check_and_consume(user_id).await {
+        respond(bot, chat, e).await;
+        return;
+    }
+
+    // Instant path: same URL+format+quality seen before.
+    if let Ok(Some(file_id)) = state
+        .cache
+        .get(&session.url_hash, "video", &quality_code)
+        .await
+    {
+        let sent = bot
+            .send_video(chat, InputFile::file_id(teloxide::types::FileId(file_id)))
+            .caption(format!("{}\n{}", session.metadata.title, quality.label()))
+            .await;
+        // A stale file_id (message deleted upstream) falls through to re-download.
+        if sent.is_ok() {
+            return;
+        }
+    }
+
+    // Queue when all workers are busy.
+    let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state.semaphore).await else {
+        return;
+    };
+
+    let cancel = CancellationToken::new();
+    state
+        .downloads
+        .lock()
+        .await
+        .insert(session_id.clone(), cancel.clone());
+
+    let progress_msg = bot
+        .send_message(chat, "⬇️ Downloading ░░░░░░░░░░ 0%")
+        .reply_markup(keyboard::cancel_keyboard(&session_id))
+        .await;
+    let Ok(progress_msg) = progress_msg else {
+        state.downloads.lock().await.remove(&session_id);
+        return;
+    };
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+
+    let work_dir = state.config.temp_dir.join(&session_id);
+    let out_path = work_dir.join("video.mp4");
+    let media = url::MediaUrl {
+        platform: session.metadata.platform,
+        url: session.url.clone(),
+    };
+
+    let progress_task = spawn_progress_forwarder(
+        rx,
+        bot.clone(),
+        chat,
+        progress_msg.id,
+        "⬇️ Downloading",
+        100,
+    );
+
+    let download = ytdlp::download_video(&media, quality, &out_path, &cancel, Some(&tx)).await;
+    drop(tx);
+    let _ = progress_task.await;
+    state.downloads.lock().await.remove(&session_id);
+
+    match download {
+        Err(Error::Cancelled) => {
+            let _ = bot
+                .edit_message_text(chat, progress_msg.id, "Cancelled.")
+                .await;
+            cleanup(&work_dir).await;
+        }
+        Err(e) => {
+            tracing::warn!("video download failed: {e}");
+            let _ = bot
+                .edit_message_text(chat, progress_msg.id, e.user_message())
+                .await;
+            cleanup(&work_dir).await;
+        }
+        Ok(path) => {
+            upload_video(
+                &bot,
+                chat,
+                progress_msg.id,
+                &path,
+                &session,
+                quality,
+                &state,
+            )
+            .await;
+            cleanup(&work_dir).await;
+        }
+    }
+}
+
+/// Upload a finished video file, cache its `file_id`.
+async fn upload_video(
+    bot: &Bot,
+    chat: ChatId,
+    progress_msg: MessageId,
+    path: &std::path::Path,
+    session: &StoredSession,
+    quality: VideoQuality,
+    state: &AppState,
+) {
+    progress_msg_update(bot, chat, progress_msg, "🔄 Uploading…").await;
+    let caption = format!(
+        "{}\n{} · {}",
+        session.metadata.title,
+        quality.label(),
+        session.metadata.platform.as_str()
+    );
+    match bot
+        .send_video(chat, InputFile::file(path.to_owned()))
+        .caption(caption)
+        .await
+    {
+        Ok(sent) => {
+            if let Some(video) = sent.video() {
+                let _ = state
+                    .cache
+                    .set(
+                        &session.url_hash,
+                        "video",
+                        quality.as_str(),
+                        &video.file.id.to_string(),
+                    )
+                    .await;
+            }
+            let _ = bot.delete_message(chat, progress_msg).await;
+        }
+        Err(e) => {
+            tracing::warn!("send_video failed: {e}");
+            let _ = bot
+                .edit_message_text(
+                    chat,
+                    progress_msg,
+                    Error::Telegram(e.to_string()).user_message(),
+                )
+                .await;
+        }
+    }
+}
+
+/// Audio pipeline: rate limit → cache → semaphore → yt-dlp → ffmpeg → tag → upload.
+#[allow(clippy::too_many_arguments)]
+async fn run_audio(
+    bot: Bot,
+    chat: ChatId,
+    origin_msg: MessageId,
+    user_id: u64,
+    session_id: String,
+    session: StoredSession,
+    quality: AudioQuality,
+    state: AppState,
+) {
+    let quality_code = quality.as_str().to_owned();
+
+    if let Err(e) = state.limiter.check_and_consume(user_id).await {
+        respond(bot, chat, e).await;
+        return;
+    }
+
+    if let Ok(Some(file_id)) = state
+        .cache
+        .get(&session.url_hash, "audio", &quality_code)
+        .await
+    {
+        let sent = bot
+            .send_audio(chat, InputFile::file_id(teloxide::types::FileId(file_id)))
+            .title(session.metadata.title.clone())
+            .await;
+        if sent.is_ok() {
+            return;
+        }
+    }
+
+    let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state.semaphore).await else {
+        return;
+    };
+
+    let cancel = CancellationToken::new();
+    state
+        .downloads
+        .lock()
+        .await
+        .insert(session_id.clone(), cancel.clone());
+
+    let progress_msg = bot
+        .send_message(chat, "⬇️ Downloading ░░░░░░░░░░ 0%")
+        .reply_markup(keyboard::cancel_keyboard(&session_id))
+        .await;
+    let Ok(progress_msg) = progress_msg else {
+        state.downloads.lock().await.remove(&session_id);
+        return;
+    };
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
+
+    let work_dir = state.config.temp_dir.join(&session_id);
+    let src_path = work_dir.join("source");
+    let mp3_path = work_dir.join("audio.mp3");
+    let media = url::MediaUrl {
+        platform: session.metadata.platform,
+        url: session.url.clone(),
+    };
+
+    let progress_task =
+        spawn_progress_forwarder(rx, bot.clone(), chat, progress_msg.id, "⬇️ Downloading", 80);
+
+    let download = ytdlp::download_audio_source(&media, &src_path, &cancel, Some(&tx)).await;
+    drop(tx);
+    let _ = progress_task.await;
+
+    let result: Result<std::path::PathBuf> = match download {
+        Err(e) => Err(e),
+        Ok(src) => {
+            progress_msg_update(&bot, chat, progress_msg.id, "🔄 Converting…").await;
+            if let Err(e) = crate::media::ffmpeg::to_mp3(&src, &mp3_path, quality, &cancel).await {
+                Err(e)
+            } else {
+                tag_downloaded_audio(&session, &mp3_path, &quality_code).await;
+                Ok(mp3_path.clone())
+            }
+        }
+    };
+    state.downloads.lock().await.remove(&session_id);
+
+    match result {
+        Err(Error::Cancelled) => {
+            let _ = bot
+                .edit_message_text(chat, progress_msg.id, "Cancelled.")
+                .await;
+            cleanup(&work_dir).await;
+        }
+        Err(e) => {
+            tracing::warn!("audio pipeline failed: {e}");
+            let _ = bot
+                .edit_message_text(chat, progress_msg.id, e.user_message())
+                .await;
+            cleanup(&work_dir).await;
+        }
+        Ok(path) => {
+            upload_audio(
+                &bot,
+                chat,
+                progress_msg.id,
+                &path,
+                &session,
+                quality,
+                &state,
+            )
+            .await;
+            cleanup(&work_dir).await;
+        }
+    }
+}
+
+/// Upload a finished `MP3`, cache its `file_id`, and retire the progress message.
+async fn upload_audio(
+    bot: &Bot,
+    chat: ChatId,
+    progress_msg: MessageId,
+    path: &std::path::Path,
+    session: &StoredSession,
+    quality: AudioQuality,
+    state: &AppState,
+) {
+    progress_msg_update(bot, chat, progress_msg, "⬆️ Uploading…").await;
+    let mut req = bot
+        .send_audio(chat, InputFile::file(path.to_owned()))
+        .title(session.metadata.title.clone());
+    if let Some(performer) = &session.metadata.uploader {
+        req = req.performer(performer.clone());
+    }
+    if let Some(d) = session
+        .metadata
+        .duration_secs
+        .and_then(|d| u32::try_from(d).ok())
+    {
+        req = req.duration(d);
+    }
+    match req.await {
+        Ok(sent) => {
+            if let Some(audio) = sent.audio() {
+                let _ = state
+                    .cache
+                    .set(
+                        &session.url_hash,
+                        "audio",
+                        quality.as_str(),
+                        &audio.file.id.to_string(),
+                    )
+                    .await;
+            }
+            let _ = bot.delete_message(chat, progress_msg).await;
+        }
+        Err(e) => {
+            tracing::warn!("send_audio failed: {e}");
+            let _ = bot
+                .edit_message_text(
+                    chat,
+                    progress_msg,
+                    Error::Telegram(e.to_string()).user_message(),
+                )
+                .await;
+        }
+    }
+}
+
+async fn respond(bot: Bot, chat: ChatId, e: Error) {
+    match e {
+        Error::RateLimited {
+            retry_in_secs,
+            remaining: _,
+        } => {
+            let _ = bot
+                .send_message(
+                    chat,
+                    format!("Too many requests. Try again in {retry_in_secs} seconds."),
+                )
+                .await;
+        }
+        other => {
+            let _ = bot.send_message(chat, other.user_message()).await;
+        }
+    }
+}
+
+async fn progress_msg_update(bot: &Bot, chat: ChatId, msg: MessageId, text: &str) {
+    let _ = bot.edit_message_text(chat, msg, text).await;
+}
+
+async fn cleanup(dir: &std::path::Path) {
+    if let Err(e) = tokio::fs::remove_dir_all(dir).await {
+        tracing::debug!("cleanup {} failed: {e}", dir.display());
+    }
+}
+
+/// Build the dispatcher schema: commands + URL messages + callbacks.
+#[must_use]
+pub fn schema() -> teloxide::dispatching::UpdateHandler<Error> {
+    use teloxide::dispatching::UpdateFilterExt;
+
+    let msg_handler = Update::filter_message()
+        .branch(dptree::filter(|msg: Message| msg.text().is_some()).endpoint(handle_message));
+    let callback_handler = Update::filter_callback_query().endpoint(handle_callback);
+
+    dptree::entry()
+        .branch(msg_handler)
+        .branch(callback_handler)
+        .branch(dptree::endpoint(|upd: Update| async move {
+            tracing::debug!("unhandled update: {:?}", upd.kind);
+            Ok(())
+        }))
+}

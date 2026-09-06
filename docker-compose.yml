@@ -1,0 +1,42 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    volumes:
+      - db:/data              # SQLite file
+      - tmp:/tmp/fetchly      # temp downloads
+    depends_on:
+      - redis
+    restart: unless-stopped
+    stop_grace_period: 120s   # let in-flight downloads finish on deploy
+
+  redis:
+    image: redis:8-alpine
+    volumes:
+      - redis:/data
+    restart: unless-stopped
+    # Uncomment to persist snapshots (sessions/counters are ephemeral,
+    # so this is optional):
+    # command: ["redis-server", "--appendonly", "yes"]
+
+  # Optional: Telegram Local Bot API Server for files >50 MB (up to 2 GB).
+  # 1. Uncomment this service.
+  # 2. Set TELEGRAM_API_URL=http://botapi:8081 in .env
+  #    (bot sends `TELEGRAM_API_URL/bot<token>/...`).
+  # botapi:
+  #   image: aiogram/telegram-bot-api:latest
+  #   environment:
+  #     TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+  #     TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+  #     TELEGRAM_LOCAL: "1"
+  #   ports:
+  #     - "8081:8081"
+  #   volumes:
+  #     - botapi:/var/lib/telegram-bot-api
+  #   restart: unless-stopped
+
+volumes:
+  db:
+  tmp:
+  redis:
+  # botapi:

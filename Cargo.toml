@@ -1,0 +1,47 @@
+[package]
+name = "fetchly"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Telegram bot: send a link, get video or audio back"
+license = "MIT"
+
+[[bin]]
+name = "fetchly"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "process", "fs", "io-util"] }
+tokio-util = { version = "0.7" }
+teloxide = { version = "0.17", features = ["macros"] }
+dptree = { version = "0.5" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+redis = { version = "1", features = ["tokio-comp", "connection-manager"] }
+lofty = { version = "0.25" }
+thiserror = { version = "2" }
+url = { version = "2" }
+uuid = { version = "1", features = ["v4"] }
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = { version = "0.15" }
+anyhow = { version = "1" }
+sha2 = { version = "0.10" }
+hex = { version = "0.4" }
+
+[dev-dependencies]
+tempfile = { version = "3" }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "allow", priority = -1 }
+cargo = { level = "allow", priority = -1 }
+missing-errors-doc = "allow"
+missing-panics-doc = "allow"
+
+[profile.release]
+strip = true
+opt-level = 3
