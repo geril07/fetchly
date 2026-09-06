@@ -1,24 +1,24 @@
-# Server setup — scoped deploy user
+# Server setup — scoped `fetchly` user
 
 One-time VPS setup. Goal: CI can redeploy and nothing else — no shell,
 no file writes, no token reads, even if the deploy key leaks.
 
 ## Trust boundary
 
-`deploy` is in the `docker` group, which is root-equivalent **with a shell**.
+`fetchly` is in the `docker` group, which is root-equivalent **with a shell**.
 So we remove the shell: the SSH key is locked to a single forced command
 (`command=` in `authorized_keys`). Reachable surface = "run redeploy", nothing more.
 
 ## 1. Service user (as root)
 
 ```bash
-adduser --disabled-password --gecos "" deploy
-usermod -aG docker deploy
-passwd -l deploy
+adduser --disabled-password --gecos "" fetchly
+usermod -aG docker fetchly
+passwd -l fetchly
 mkdir -p /opt/fetchly
 ```
 
-`/opt/fetchly` stays **root-owned**. `deploy` needs no write access anywhere.
+`/opt/fetchly` stays **root-owned**. `fetchly` needs no write access anywhere.
 
 ## 2. Forced redeploy command (as root)
 
@@ -44,27 +44,29 @@ and ignores whatever command SSH requested.)
 
 ## 3. Lock the key to that command (as root)
 
-`~deploy/.ssh/authorized_keys` — **one line**, restrictions first:
+First generate the keypair (§5 below) — you need its `.pub` content here.
+
+`~fetchly/.ssh/authorized_keys` — **one line**, restrictions first:
 
 ```
 command="/opt/fetchly/deploy.sh",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA... fetchly-deploy
 ```
 
 ```bash
-chmod 700 ~deploy/.ssh
-chmod 600 ~deploy/.ssh/authorized_keys
-chown -R deploy:deploy ~deploy/.ssh
+chmod 700 ~fetchly/.ssh
+chmod 600 ~fetchly/.ssh/authorized_keys
+chown -R fetchly:fetchly ~fetchly/.ssh
 ```
 
 ## 4. Secrets file (as root)
 
 ```bash
 nano /opt/fetchly/.env   # TELEGRAM_BOT_TOKEN, REDIS_URL=redis://redis:6379, ...
-chown root:deploy /opt/fetchly/.env
+chown root:fetchly /opt/fetchly/.env
 chmod 640 /opt/fetchly/.env
 ```
 
-`deploy` can read it (compose needs that) but cannot modify it — the token
+`fetchly` can read it (compose needs that) but cannot modify it — the token
 cannot be overwritten or exfiltrated through a file write. (Reading via a
 shell is impossible: there is no shell.)
 
@@ -78,7 +80,7 @@ ssh-keygen -t ed25519 -f ~/.ssh/fetchly_deploy -N "" -C "fetchly-deploy"
 ## 6. Test (from your laptop)
 
 ```bash
-ssh -i ~/.ssh/fetchly_deploy deploy@<SERVER_IP>
+ssh -i ~/.ssh/fetchly_deploy fetchly@<SERVER_IP>
 # Expected: deploy runs (pull + up -d), prints compose output, disconnects.
 # `ssh -t ... bash` must NOT give you a shell — it runs deploy.sh instead.
 ```
@@ -87,14 +89,14 @@ ssh -i ~/.ssh/fetchly_deploy deploy@<SERVER_IP>
 
 ```bash
 gh secret set SERVER_HOST --body "<SERVER_IP>"
-gh secret set SERVER_USER --body "deploy"
+gh secret set SERVER_USER --body "fetchly"
 gh secret set SERVER_SSH_KEY < ~/.ssh/fetchly_deploy   # private key, local file → secret, never chat
 ```
 
 ## 8. First boot (manual, once)
 
 ```bash
-ssh -i ~/.ssh/fetchly_deploy deploy@<SERVER_IP>   # runs deploy; image must exist (push to main first)
+ssh -i ~/.ssh/fetchly_deploy fetchly@<SERVER_IP>   # runs deploy; image must exist (push to main first)
 ```
 
 Check from root on the server:
