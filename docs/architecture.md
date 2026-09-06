@@ -354,8 +354,8 @@ jobs:
 ### Server setup (one-time)
 
 1. Install Docker + Docker Compose on server.
-2. `mkdir /opt/fetchly`, place `docker-compose.yml` and `.env` there.
-3. `docker login ghcr.io` with a PAT (read:packages scope).
+2. `mkdir /opt/fetchly`, place `docker-compose.yml` (server variant, `image:`) and `.env` there.
+3. Make the GHCR package public (one-time): package page → Settings → Change visibility → Public. Public packages pull anonymously — no `docker login` needed on the server.
 4. Add GitHub repo secrets: `SERVER_HOST`, `SERVER_USER`, `SERVER_SSH_KEY`.
 
 ### docker-compose.yml on server
