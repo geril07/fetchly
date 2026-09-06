@@ -112,4 +112,45 @@ mod tests {
         assert!(info.artist.is_none());
         assert!(info.cover_bytes.is_none());
     }
+
+    /// Roundtrip through lofty: tag a copy of the committed fixture,
+    /// re-read it, assert fields + embedded cover. Never mutates the fixture.
+    #[tokio::test]
+    async fn tag_roundtrip_on_fixture() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = dir.path().join("work.mp3");
+        std::fs::copy("../tests/fixtures/silence.mp3", &work)
+            .or_else(|_| std::fs::copy("tests/fixtures/silence.mp3", &work))
+            .expect("fixture exists (run from crate root or workspace root)");
+
+        tag_mp3(
+            &work,
+            TagInfo {
+                title: "Test Track".to_owned(),
+                artist: Some("Test Artist".to_owned()),
+                album: Some("Test Album".to_owned()),
+                year: None,
+                cover_bytes: Some(b"fake-image-bytes".to_vec()),
+                cover_mime: Some("image/jpeg".to_owned()),
+            },
+        )
+        .await
+        .expect("tagging succeeds");
+
+        let tagged = lofty::probe::Probe::open(&work)
+            .expect("open")
+            .read()
+            .expect("read");
+        let tag = {
+            use lofty::file::TaggedFileExt as _;
+            tagged.primary_tag().expect("primary tag")
+        };
+        {
+            use lofty::tag::Accessor as _;
+            assert_eq!(tag.title().as_deref(), Some("Test Track"));
+            assert_eq!(tag.artist().as_deref(), Some("Test Artist"));
+            assert_eq!(tag.album().as_deref(), Some("Test Album"));
+        }
+        assert_eq!(tag.pictures().len(), 1);
+    }
 }
