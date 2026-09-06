@@ -217,7 +217,7 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
                 .text("Nothing to cancel.")
                 .await?;
             let _ = state.sessions.delete(&session_id).await;
-            let _ = bot.edit_message_text(chat, msg_id, "Cancelled.").await;
+            edit_preview_text(&bot, chat, msg_id, "Cancelled.").await;
         }
         return Ok(());
     }
@@ -226,8 +226,7 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
         bot.answer_callback_query(q.id)
             .text("Session expired. Send the link again.")
             .await?;
-        bot.edit_message_text(chat, msg_id, "Session expired. Send the link again.")
-            .await?;
+        edit_preview_text(&bot, chat, msg_id, "Session expired. Send the link again.").await;
         return Ok(());
     };
 
@@ -258,10 +257,11 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
                 return Ok(());
             };
             bot.answer_callback_query(q.id).await?;
-            run_video(
+            // Detached: the chat's update queue must stay live for ❌ taps
+            // while the multi-minute pipeline runs (see fix 3 notes).
+            tokio::spawn(run_video(
                 bot, chat, msg_id, user_id, session_id, session, quality, state,
-            )
-            .await;
+            ));
         }
         ('a', code) => {
             let Some(quality) = AudioQuality::parse_code(code) else {
@@ -271,10 +271,9 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
                 return Ok(());
             };
             bot.answer_callback_query(q.id).await?;
-            run_audio(
+            tokio::spawn(run_audio(
                 bot, chat, msg_id, user_id, session_id, session, quality, state,
-            )
-            .await;
+            ));
         }
         _ => {
             bot.answer_callback_query(q.id).await?;
@@ -346,6 +345,39 @@ async fn tag_downloaded_audio(
     }
 }
 
+/// Standard Bot API caps uploads at 50 MB; larger files need a Local Bot API
+/// Server (see `TELEGRAM_API_URL`). Checked before attempting a doomed upload.
+const STANDARD_UPLOAD_LIMIT: u64 = 50_000_000;
+
+const OVER_LIMIT_MSG: &str = "This file is over 50 MB, which exceeds the standard Bot API upload limit. Pick a lower quality, or set up a Local Bot API Server for files up to 2 GB.";
+
+async fn exceeds_standard_limit(path: &std::path::Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|m| m.len() > STANDARD_UPLOAD_LIMIT)
+}
+
+/// Map an upload failure to user text. A 413 from Telegram means the file
+/// passed our 2 GB guard but exceeds the 50 MB standard-API cap (e.g. the
+/// size estimate was off or the limit check was bypassed by cache racing).
+fn upload_error_message(raw: &str) -> String {
+    if raw.to_lowercase().contains("too large") {
+        OVER_LIMIT_MSG.to_owned()
+    } else {
+        Error::Telegram(raw.to_owned()).user_message()
+    }
+}
+
+/// Edit a preview card that may be a text message or a photo caption.
+/// Telegram rejects `editMessageText` on photos ("no text in the message"),
+/// so fall back to `editMessageCaption`.
+async fn edit_preview_text(bot: &Bot, chat: ChatId, msg: MessageId, text: &str) {
+    if bot.edit_message_text(chat, msg, text).await.is_ok() {
+        return;
+    }
+    let _ = bot.edit_message_caption(chat, msg).caption(text).await;
+}
+
 /// Acquire a download slot, telling the user they are queued when busy.
 async fn acquire_permit(
     bot: &Bot,
@@ -354,13 +386,13 @@ async fn acquire_permit(
     semaphore: &Arc<tokio::sync::Semaphore>,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
     if semaphore.available_permits() == 0 {
-        let _ = bot
-            .edit_message_text(
-                chat,
-                origin_msg,
-                "⏳ Queued… your download starts automatically.",
-            )
-            .await;
+        edit_preview_text(
+            bot,
+            chat,
+            origin_msg,
+            "⏳ Queued… your download starts automatically.",
+        )
+        .await;
     }
     semaphore.clone().acquire_owned().await.ok()
 }
@@ -458,6 +490,13 @@ async fn run_video(
             cleanup(&work_dir).await;
         }
         Ok(path) => {
+            if exceeds_standard_limit(&path).await && state.config.api_url.is_none() {
+                let _ = bot
+                    .edit_message_text(chat, progress_msg.id, OVER_LIMIT_MSG)
+                    .await;
+                cleanup(&work_dir).await;
+                return;
+            }
             upload_video(
                 &bot,
                 chat,
@@ -512,11 +551,7 @@ async fn upload_video(
         Err(e) => {
             tracing::warn!("send_video failed: {e}");
             let _ = bot
-                .edit_message_text(
-                    chat,
-                    progress_msg,
-                    Error::Telegram(e.to_string()).user_message(),
-                )
+                .edit_message_text(chat, progress_msg, upload_error_message(&e.to_string()))
                 .await;
         }
     }
@@ -620,6 +655,13 @@ async fn run_audio(
             cleanup(&work_dir).await;
         }
         Ok(path) => {
+            if exceeds_standard_limit(&path).await && state.config.api_url.is_none() {
+                let _ = bot
+                    .edit_message_text(chat, progress_msg.id, OVER_LIMIT_MSG)
+                    .await;
+                cleanup(&work_dir).await;
+                return;
+            }
             upload_audio(
                 &bot,
                 chat,
@@ -677,11 +719,7 @@ async fn upload_audio(
         Err(e) => {
             tracing::warn!("send_audio failed: {e}");
             let _ = bot
-                .edit_message_text(
-                    chat,
-                    progress_msg,
-                    Error::Telegram(e.to_string()).user_message(),
-                )
+                .edit_message_text(chat, progress_msg, upload_error_message(&e.to_string()))
                 .await;
         }
     }
@@ -768,5 +806,17 @@ mod tests {
         assert_eq!(extract_url("just some words"), None);
         assert_eq!(extract_url(""), None);
         assert_eq!(extract_url("/start"), None);
+    }
+
+    #[test]
+    fn upload_error_maps_413_to_limit_advice() {
+        assert_eq!(
+            upload_error_message("A Telegram's error: Request Entity Too Large"),
+            OVER_LIMIT_MSG
+        );
+        assert_eq!(
+            upload_error_message("Bad Request: chat not found"),
+            "Something went wrong. Try again later."
+        );
     }
 }
