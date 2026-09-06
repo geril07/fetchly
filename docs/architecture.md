@@ -312,7 +312,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2

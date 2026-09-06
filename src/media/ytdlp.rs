@@ -582,7 +582,7 @@ mod tests {
             VideoQuality::Best,
         ] {
             assert!(!q.format_selector().is_empty());
-            assert!(VideoQuality::parse_code(q.as_str()) == Some(q));
+            assert_eq!(VideoQuality::parse_code(q.as_str()), Some(q));
         }
         for q in [
             AudioQuality::K128,
@@ -591,7 +591,7 @@ mod tests {
             AudioQuality::Best,
         ] {
             assert!(!q.mp3_bitrate().is_empty());
-            assert!(AudioQuality::parse_code(q.as_str()) == Some(q));
+            assert_eq!(AudioQuality::parse_code(q.as_str()), Some(q));
         }
     }
 

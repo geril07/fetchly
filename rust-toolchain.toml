@@ -1,0 +1,5 @@
+[toolchain]
+# Pinned so local builds and CI run the identical compiler/clippy.
+# New clippy versions add lints, and `-D warnings` turns any drift red.
+channel = "1.98"
+components = ["rustfmt", "clippy"]

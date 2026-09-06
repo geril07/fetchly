@@ -110,10 +110,12 @@ impl FileCache {
         );
         tokio::task::spawn_blocking(move || {
             let conn = inner.lock().map_err(|e| Error::Cache(e.to_string()))?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| i64::try_from(d.as_secs()).unwrap_or(0))
-                .unwrap_or(0);
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            )
+            .unwrap_or(0);
             conn.execute(
                 "INSERT OR REPLACE INTO file_cache
                      (url_hash, format, quality, file_id, created_at)
