@@ -179,18 +179,24 @@ Multi-stage build:
 
 ```
 Stage 1 — builder
-  rust:1.87-bookworm
+  rust:1.98-trixie
   cargo build --release
 
 Stage 2 — runtime
-  debian:bookworm-slim
-  apt install: python3, python3-pip, ffmpeg
-  pip install: yt-dlp
+  debian:trixie-slim
+  apt install: ca-certificates, curl, ffmpeg
+  yt-dlp standalone binary from GitHub releases
   copy binary from builder
   ENTRYPOINT ["./fetchly"]
 ```
 
-Rust compiles to a single static binary. Runtime image only needs Python (for yt-dlp) and ffmpeg.
+Pinned September 2026. `bookworm` is oldstable (Debian 13 `trixie` is stable).
+yt-dlp comes as the standalone `yt-dlp_linux` binary (bundles its own Python):
+`pip install` is blocked by PEP 668 on trixie and lags on extractor fixes.
+Rebuild the image regularly — extractors rot within weeks on stale builds.
+
+Rust compiles to a single static binary. Runtime image needs ffmpeg plus
+curl/ca-certificates to fetch yt-dlp — no Python toolchain.
 
 ### docker-compose.yml
 
@@ -204,9 +210,11 @@ services:
       - tmp:/tmp/fetchly      # temp downloads
     depends_on:
       - redis
+    restart: unless-stopped
+    stop_grace_period: 120s   # let in-flight downloads finish on deploy
 
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     volumes:
       - redis:/data
 
@@ -216,15 +224,38 @@ volumes:
   redis:
 ```
 
+Pinned September 2026 (`redis:7-alpine` is outdated; latest is 8.x).
+
+Optional: Telegram Local Bot API Server for files >50 MB (up to 2 GB).
+Uncomment to enable, and set `TELEGRAM_API_URL=http://botapi:8081` in `.env`:
+
+```yaml
+  # botapi:
+  #   image: aiogram/telegram-bot-api:latest
+  #   environment:
+  #     TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+  #     TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+  #     TELEGRAM_LOCAL: "1"
+  #   ports:
+  #     - "8081:8081"
+  #   volumes:
+  #     - botapi:/var/lib/telegram-bot-api
+```
+
 ### .env.example
 
 ```env
 TELEGRAM_BOT_TOKEN=
+# Optional: Local Bot API Server base URL (for >50 MB uploads).
+# Example with the commented `botapi` service above:
+# TELEGRAM_API_URL=http://botapi:8081
+TELEGRAM_API_URL=
 FETCHLY_MAX_WORKERS=4
 FETCHLY_RATE_LIMIT=20           # downloads per user per hour
 FETCHLY_DB_PATH=/data/fetchly.db
 FETCHLY_TEMP_DIR=/tmp/fetchly
 REDIS_URL=redis://redis:6379
+RUST_LOG=fetchly=info,teloxide=warn
 ```
 
 ### Volumes
@@ -280,9 +311,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-features
 
   deploy:
     needs: test
@@ -290,15 +326,15 @@ jobs:
     permissions:
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           push: true
           tags: ${{ env.IMAGE }}:latest
@@ -336,9 +372,10 @@ services:
       - tmp:/tmp/fetchly
     depends_on:
       - redis
+    restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis:8-alpine
     volumes:
       - redis:/data
 

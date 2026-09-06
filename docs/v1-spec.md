@@ -121,19 +121,23 @@ Per-user: **20 downloads per hour**. Show remaining quota on limit hit.
 
 ## Tech stack
 
-| Component        | Tool                              |
-|-----------------|----------------------------------|
-| Language         | Rust (2024 edition)              |
-| Async runtime    | tokio                            |
-| Bot framework    | teloxide                         |
-| Extraction       | yt-dlp (subprocess)              |
-| Audio conversion | ffmpeg (subprocess)              |
-| MP3 tags         | lofty                            |
-| HTTP client      | reqwest                          |
-| Serialization    | serde + serde_json               |
-| File-ID cache    | SQLite (rusqlite)                |
-| Sessions + rate  | Redis (redis crate, async)       |
-| Task queue       | None in V1 (tokio tasks)         |
+Versions pinned September 2026.
+
+| Component        | Tool                                             | Version                          |
+|-----------------|--------------------------------------------------|----------------------------------|
+| Language         | Rust (2024 edition)                              | toolchain 1.98                   |
+| Async runtime    | tokio                                            | 1                                |
+| Async utilities  | tokio-util (`CancellationToken`)                 | 0.7                              |
+| Bot framework    | teloxide                                         | 0.17                             |
+| Extraction       | yt-dlp standalone binary (GitHub releases)       | latest at image build time       |
+| Audio conversion | ffmpeg (Debian package)                          | trixie                           |
+| MP3 tags         | lofty                                            | 0.25                             |
+| HTTP client      | reqwest                                          | 0.13                             |
+| Serialization    | serde + serde_json                               | 1                                |
+| File-ID cache    | SQLite (rusqlite, `bundled`)                     | 0.40                             |
+| Sessions + rate  | Redis (`redis` crate, `tokio-comp` feature)      | server 8 / crate 1               |
+| Task queue       | None in V1 (tokio tasks)                         | —                                |
+| Lints            | rustfmt + clippy (`all=deny`, `pedantic=warn`)   | enforced in CI                   |
 
 ## Non-goals for V1
 

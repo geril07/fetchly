@@ -30,11 +30,25 @@ tokio::sync::Semaphore with `FETCHLY_MAX_WORKERS` env var (default 4). No extern
 
 ## yt-dlp + ffmpeg as subprocesses, no library bindings
 
-Both called via tokio::process::Command. No Rust bindings to libav or yt-dlp internals. Simpler, easier to update (just pip install / apt upgrade), same performance for this use case.
+Both called via tokio::process::Command. No Rust bindings to libav or yt-dlp internals. Simpler, easier to update (re-download the yt-dlp binary / apt upgrade ffmpeg), same performance for this use case.
 
 ## GitHub Actions + GHCR + SSH deploy
 
 CI builds image, pushes to GitHub Container Registry (free, bundled with repo), SSHs into server to pull + restart. No Kubernetes, no Ansible, no Terraform. Single server doesn't need more.
+
+CI gate (September 2026 pins): `actions/checkout@v6`, `dtolnay/rust-toolchain@stable`
+(not deprecated — only `rs-workspace/rust-toolchain` is), `docker/login-action@v4`,
+`docker/build-push-action@v7`. Test job runs `cargo fmt --check`, `cargo clippy
+--all-targets --all-features -- -D warnings`, `cargo test`.
+
+## Pinned toolchain (September 2026)
+
+- Rust 1.98, Debian 13 `trixie` (`bookworm` is oldstable), Redis 8 (`redis:7-alpine`
+  is outdated). Re-pin yearly or when a dependency breaks the build.
+- yt-dlp as standalone binary, not pip: trixie blocks system pip (PEP 668) and
+  the pip build lags on extractor fixes. Rebuild the image regularly.
+- Clippy `all=deny` + `pedantic=warn`, enforced with `-D warnings` in CI.
+  `rusqlite` calls go through `spawn_blocking` (it is synchronous).
 
 ## File structure: low coupling, high cohesion, high colocation
 
