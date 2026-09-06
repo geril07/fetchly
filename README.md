@@ -2,6 +2,8 @@
 
 Telegram bot: send a link, get the video or audio file back. Rust + teloxide + yt-dlp.
 
+Live: [@fetchly_geril_bot](https://t.me/fetchly_geril_bot)
+
 ## Supported platforms
 
 | Platform  | Video | Audio | Extras           |
