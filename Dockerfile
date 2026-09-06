@@ -5,7 +5,10 @@ COPY Cargo.toml Cargo.lock ./
 # Cache deps first (dummy main to warm the registry).
 RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && cargo build --release || true
 COPY src ./src
-RUN cargo build --release
+# COPY preserves host mtimes, which predate the warmup artifacts above.
+# Cargo trusts mtimes (older sources = "fresh") and would skip the rebuild,
+# shipping the dummy binary — so bump mtimes to force a real rebuild.
+RUN find src -name '*.rs' -exec touch {} + && cargo build --release
 
 # ---- Stage 2: runtime ----
 FROM debian:trixie-slim
