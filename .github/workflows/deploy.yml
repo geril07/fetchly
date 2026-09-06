@@ -45,6 +45,10 @@ jobs:
           tags: ${{ env.IMAGE }}:latest
 
       - name: Deploy to server
+        # NOTE: the server locks this key to /opt/fetchly/deploy.sh via
+        # authorized_keys `command=` (see docs/server-setup.md), so the
+        # script below documents intent — the server always runs deploy.sh.
+        # Keep both in sync.
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.SERVER_HOST }}

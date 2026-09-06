@@ -353,6 +353,9 @@ jobs:
 
 ### Server setup (one-time)
 
+Full steps (scoped deploy user, forced command, firewall, backups):
+see [`server-setup.md`](server-setup.md).
+
 1. Install Docker + Docker Compose on server.
 2. `mkdir /opt/fetchly`, place `docker-compose.yml` (server variant, `image:`) and `.env` there.
 3. Make the GHCR package public (one-time): package page → Settings → Change visibility → Public. Public packages pull anonymously — no `docker login` needed on the server.
