@@ -58,9 +58,44 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     #[test]
     fn key_format() {
         assert_eq!(RateLimiter::key(123), "fetchly:ratelimit:123");
+    }
+
+    #[tokio::test]
+    async fn consumes_down_to_zero_then_rate_limits() {
+        let Some(t) = crate::testutil::start_redis().await else {
+            return;
+        };
+        let limiter = RateLimiter::new(t.manager.clone(), 3);
+        assert_eq!(limiter.check_and_consume(1001).await.expect("1st"), 2);
+        assert_eq!(limiter.check_and_consume(1001).await.expect("2nd"), 1);
+        assert_eq!(limiter.check_and_consume(1001).await.expect("3rd"), 0);
+        match limiter.check_and_consume(1001).await {
+            Err(Error::RateLimited {
+                retry_in_secs,
+                remaining,
+            }) => {
+                assert!(retry_in_secs > 0 && retry_in_secs <= 3600);
+                assert_eq!(remaining, 0);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn users_are_isolated() {
+        let Some(t) = crate::testutil::start_redis().await else {
+            return;
+        };
+        let limiter = RateLimiter::new(t.manager.clone(), 2);
+        assert_eq!(limiter.check_and_consume(2001).await.expect("A1"), 1);
+        assert_eq!(limiter.check_and_consume(2001).await.expect("A2"), 0);
+        assert!(limiter.check_and_consume(2001).await.is_err());
+        // B is unaffected by A's exhaustion.
+        assert_eq!(limiter.check_and_consume(2002).await.expect("B1"), 1);
     }
 }

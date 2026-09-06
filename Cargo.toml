@@ -33,6 +33,7 @@ hex = { version = "0.4" }
 
 [dev-dependencies]
 tempfile = { version = "3" }
+testcontainers = { version = "0.28" }
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }

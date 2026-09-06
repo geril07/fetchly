@@ -5,6 +5,8 @@ mod limiter;
 mod media;
 mod session;
 mod telegram;
+#[cfg(test)]
+mod testutil;
 
 use std::sync::Arc;
 

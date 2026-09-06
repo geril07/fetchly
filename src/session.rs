@@ -123,4 +123,84 @@ mod tests {
             assert!(data.len() <= 64, "{data}");
         }
     }
+
+    fn test_metadata() -> Metadata {
+        use crate::media::url::Platform;
+        Metadata {
+            title: "T".to_owned(),
+            duration_secs: Some(60),
+            thumbnail_url: None,
+            platform: Platform::Youtube,
+            webpage_url: "https://youtu.be/x".to_owned(),
+            view_count: None,
+            uploader: None,
+            video_options: vec![],
+            audio_options: vec![],
+        }
+    }
+
+    /// Each test spins its own Redis; skips (loudly) without Docker.
+    /// The returned guard keeps the container alive for the whole test —
+    /// dropping it kills Redis, so bind it in the test body.
+    async fn test_redis() -> Option<crate::testutil::TestRedis> {
+        crate::testutil::start_redis().await
+    }
+
+    #[tokio::test]
+    async fn create_get_roundtrip() {
+        let Some(t) = test_redis().await else { return };
+        let store = SessionStore::new(t.manager.clone());
+        let id = store
+            .create("hash1", "https://youtu.be/x", &test_metadata())
+            .await
+            .expect("create");
+        assert_eq!(id.len(), 8);
+        let got = store.get(&id).await.expect("get");
+        assert_eq!(got.url_hash, "hash1");
+        assert_eq!(got.url, "https://youtu.be/x");
+        assert_eq!(got.metadata.title, "T");
+    }
+
+    #[tokio::test]
+    async fn get_missing_is_expired() {
+        let Some(t) = test_redis().await else { return };
+        let store = SessionStore::new(t.manager.clone());
+        let err = store.get("doesnotexist").await.expect_err("missing");
+        assert!(matches!(err, Error::SessionExpired));
+    }
+
+    #[tokio::test]
+    async fn delete_removes_session() {
+        let Some(t) = test_redis().await else { return };
+        let store = SessionStore::new(t.manager.clone());
+        let id = store
+            .create("h", "https://youtu.be/x", &test_metadata())
+            .await
+            .expect("create");
+        store.delete(&id).await.expect("delete");
+        assert!(matches!(store.get(&id).await, Err(Error::SessionExpired)));
+    }
+
+    #[tokio::test]
+    async fn session_key_has_10min_ttl() {
+        let Some(t) = crate::testutil::start_redis().await else {
+            return;
+        };
+        let store = SessionStore::new(t.manager.clone());
+        let id = store
+            .create("h", "https://youtu.be/x", &test_metadata())
+            .await
+            .expect("create");
+        let mut conn = t
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("redis conn");
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(format!("session:{id}"))
+            .query_async(&mut conn)
+            .await
+            .expect("TTL");
+        assert!(ttl > 0 && ttl <= 600, "ttl={ttl}");
+    }
 }
