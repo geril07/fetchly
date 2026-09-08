@@ -32,6 +32,8 @@ pub struct AppState {
     /// Registered before semaphore acquisition (covers the queued state),
     /// removed on every pipeline exit. Read once at shutdown for notices.
     pub notify: Arc<tokio::sync::Mutex<HashMap<String, ChatId>>>,
+    /// In-flight downloads per user (queued + running count toward the cap).
+    pub user_slots: Arc<tokio::sync::Mutex<HashMap<u64, usize>>>,
     pub http: reqwest::Client,
 }
 
@@ -53,6 +55,7 @@ impl AppState {
             semaphore,
             downloads: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             notify: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            user_slots: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             http,
         }
     }
@@ -67,7 +70,7 @@ enum Command {
 
 const WELCOME: &str =
     "Send me a YouTube, TikTok, Instagram, or X link and I'll fetch the video or audio for you.";
-const HELP: &str = "Send a link → tap 🎬 Video or 🎵 Audio → pick quality.\n\nCommands:\n/start — welcome\n/help — this guide\n\nLimits: 20 downloads/hour, 2 GB max file size.";
+const HELP: &str = "Send a link → tap 🎬 Video or 🎵 Audio → pick quality.\n\nCommands:\n/start — welcome\n/help — this guide\n\nLimits: 20 downloads/hour, 2 at a time, 2 GB max file size.";
 
 /// Entry point for text messages.
 pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
@@ -477,6 +480,30 @@ pub async fn shutdown_notify(bot: Bot, state: &AppState) {
     }
 }
 
+/// Take one of the user's in-flight slots (queued + running count toward
+/// `max_per_user`). Returns `false` when the user is at their cap.
+async fn acquire_user_slot(state: &AppState, user_id: u64) -> bool {
+    let mut slots = state.user_slots.lock().await;
+    let used = slots.get(&user_id).copied().unwrap_or(0);
+    if used >= state.config.max_per_user {
+        return false;
+    }
+    slots.insert(user_id, used + 1);
+    true
+}
+
+/// Release a slot taken by [`acquire_user_slot`]. Called on every pipeline
+/// exit after acquisition — audit these sites when adding new returns.
+async fn release_user_slot(state: &AppState, user_id: u64) {
+    let mut slots = state.user_slots.lock().await;
+    if let Some(used) = slots.get_mut(&user_id) {
+        *used = used.saturating_sub(1);
+        if *used == 0 {
+            slots.remove(&user_id);
+        }
+    }
+}
+
 /// Video download pipeline: rate limit → cache → semaphore → yt-dlp → upload.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_video(
@@ -512,11 +539,25 @@ async fn run_video(
         }
     }
 
+    // One user must not hold every worker: queued + running count toward the cap.
+    if !acquire_user_slot(&state, user_id).await {
+        respond(
+            bot,
+            chat,
+            Error::TooManyConcurrent {
+                max: state.config.max_per_user,
+            },
+        )
+        .await;
+        return;
+    }
+
     // Queue when all workers are busy.
     // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
     let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state.semaphore).await else {
         state.notify.lock().await.remove(&session_id);
+        release_user_slot(&state, user_id).await;
         return;
     };
 
@@ -538,6 +579,7 @@ async fn run_video(
     let Ok(progress_msg) = progress_msg else {
         state.downloads.lock().await.remove(&session_id);
         state.notify.lock().await.remove(&session_id);
+        release_user_slot(&state, user_id).await;
         return;
     };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
@@ -569,6 +611,7 @@ async fn run_video(
     let _ = progress_task.await;
     state.downloads.lock().await.remove(&session_id);
     state.notify.lock().await.remove(&session_id);
+    release_user_slot(&state, user_id).await;
 
     match download {
         Err(Error::Cancelled) => {
@@ -685,10 +728,24 @@ async fn run_audio(
         }
     }
 
+    // One user must not hold every worker: queued + running count toward the cap.
+    if !acquire_user_slot(&state, user_id).await {
+        respond(
+            bot,
+            chat,
+            Error::TooManyConcurrent {
+                max: state.config.max_per_user,
+            },
+        )
+        .await;
+        return;
+    }
+
     // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
     let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state.semaphore).await else {
         state.notify.lock().await.remove(&session_id);
+        release_user_slot(&state, user_id).await;
         return;
     };
 
@@ -710,6 +767,7 @@ async fn run_audio(
     let Ok(progress_msg) = progress_msg else {
         state.downloads.lock().await.remove(&session_id);
         state.notify.lock().await.remove(&session_id);
+        release_user_slot(&state, user_id).await;
         return;
     };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
@@ -756,6 +814,7 @@ async fn run_audio(
     };
     state.downloads.lock().await.remove(&session_id);
     state.notify.lock().await.remove(&session_id);
+    release_user_slot(&state, user_id).await;
 
     match result {
         Err(Error::Cancelled) => {
@@ -965,5 +1024,39 @@ mod tests {
             Err(Error::TimedOut { minutes }) => assert_eq!(minutes, 15),
             other => panic!("expected TimedOut, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn user_slots_cap_counts_and_releases() {
+        let Some(t) = crate::testutil::start_redis().await else {
+            return;
+        };
+        let config = Config {
+            bot_token: "test".to_owned(),
+            api_url: None,
+            max_workers: 1,
+            download_timeout_secs: 900,
+            rate_limit: 20,
+            max_per_user: 1,
+            db_path: std::path::PathBuf::from(":memory:"),
+            temp_dir: std::path::PathBuf::from("/tmp/fetchly-test"),
+            redis_url: String::new(),
+        };
+        let state = AppState::new(
+            config,
+            FileCache::open_in_memory().expect("cache"),
+            SessionStore::new(t.manager.clone()),
+            RateLimiter::new(t.manager.clone(), 20),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            reqwest::Client::new(),
+        );
+        assert!(acquire_user_slot(&state, 7).await);
+        assert!(!acquire_user_slot(&state, 7).await, "cap is 1");
+        assert!(acquire_user_slot(&state, 8).await, "other users unaffected");
+        release_user_slot(&state, 7).await;
+        assert!(acquire_user_slot(&state, 7).await, "release frees the slot");
+        release_user_slot(&state, 7).await;
+        release_user_slot(&state, 8).await;
+        assert!(state.user_slots.lock().await.is_empty(), "no slot leaks");
     }
 }
