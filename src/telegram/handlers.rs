@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use teloxide::prelude::*;
 use teloxide::types::{
@@ -34,6 +35,9 @@ pub struct AppState {
     pub notify: Arc<tokio::sync::Mutex<HashMap<String, ChatId>>>,
     /// In-flight downloads per user (queued + running count toward the cap).
     pub user_slots: Arc<tokio::sync::Mutex<HashMap<u64, usize>>>,
+    /// Tasks currently inside semaphore admission (parked waiters + handoff).
+    /// Global backpressure bound; decremented right after a permit is granted.
+    pub queued: Arc<AtomicUsize>,
     pub http: reqwest::Client,
 }
 
@@ -56,6 +60,7 @@ impl AppState {
             downloads: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             notify: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             user_slots: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            queued: Arc::new(AtomicUsize::new(0)),
             http,
         }
     }
@@ -388,13 +393,30 @@ async fn edit_preview_text(bot: &Bot, chat: ChatId, msg: MessageId, text: &str) 
 }
 
 /// Acquire a download slot, telling the user they are queued when busy.
+/// Over the global waiter cap (`max_queued`), reject immediately with a busy
+/// notice instead of parking another task — this is the backpressure bound
+/// that keeps overload from growing memory and update-queue depth.
 async fn acquire_permit(
     bot: &Bot,
     chat: ChatId,
     origin_msg: MessageId,
-    semaphore: &Arc<tokio::sync::Semaphore>,
+    state: &AppState,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    if semaphore.available_permits() == 0 {
+    let parked = state.queued.fetch_add(1, Ordering::SeqCst);
+    if parked >= state.config.max_queued {
+        state.queued.fetch_sub(1, Ordering::SeqCst);
+        tracing::warn!("waiter cap hit ({parked} parked); rejecting tap");
+        edit_preview_text(
+            bot,
+            chat,
+            origin_msg,
+            "🔥 Fetchly is busy right now. Try again in a bit.",
+        )
+        .await;
+        return None;
+    }
+    if state.semaphore.available_permits() == 0 {
+        tracing::info!("download queued (depth {})", parked + 1);
         edit_preview_text(
             bot,
             chat,
@@ -403,7 +425,9 @@ async fn acquire_permit(
         )
         .await;
     }
-    semaphore.clone().acquire_owned().await.ok()
+    let permit = state.semaphore.clone().acquire_owned().await.ok();
+    state.queued.fetch_sub(1, Ordering::SeqCst);
+    permit
 }
 
 /// Run a pipeline stage against an absolute deadline (whole-pipeline budget:
@@ -555,7 +579,7 @@ async fn run_video(
     // Queue when all workers are busy.
     // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
-    let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state.semaphore).await else {
+    let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state).await else {
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
         return;
@@ -743,7 +767,7 @@ async fn run_audio(
 
     // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
-    let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state.semaphore).await else {
+    let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state).await else {
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
         return;
@@ -1038,6 +1062,7 @@ mod tests {
             download_timeout_secs: 900,
             rate_limit: 20,
             max_per_user: 1,
+            max_queued: 20,
             db_path: std::path::PathBuf::from(":memory:"),
             temp_dir: std::path::PathBuf::from("/tmp/fetchly-test"),
             redis_url: String::new(),
@@ -1058,5 +1083,38 @@ mod tests {
         release_user_slot(&state, 7).await;
         release_user_slot(&state, 8).await;
         assert!(state.user_slots.lock().await.is_empty(), "no slot leaks");
+    }
+
+    #[tokio::test]
+    async fn waiter_counter_returns_to_zero_after_admit() {
+        let Some(t) = crate::testutil::start_redis().await else {
+            return;
+        };
+        let config = Config {
+            bot_token: "test".to_owned(),
+            api_url: None,
+            max_workers: 2,
+            download_timeout_secs: 900,
+            rate_limit: 20,
+            max_per_user: 2,
+            max_queued: 20,
+            db_path: std::path::PathBuf::from(":memory:"),
+            temp_dir: std::path::PathBuf::from("/tmp/fetchly-test"),
+            redis_url: String::new(),
+        };
+        let state = AppState::new(
+            config,
+            FileCache::open_in_memory().expect("cache"),
+            SessionStore::new(t.manager.clone()),
+            RateLimiter::new(t.manager.clone(), 20),
+            Arc::new(tokio::sync::Semaphore::new(2)),
+            reqwest::Client::new(),
+        );
+        // Free permits: no Telegram calls, pure admission accounting.
+        let bot = Bot::new("test-token");
+        let permit = acquire_permit(&bot, ChatId(1), MessageId(1), &state).await;
+        assert!(permit.is_some());
+        assert_eq!(state.queued.load(Ordering::SeqCst), 0);
+        drop(permit);
     }
 }

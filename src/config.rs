@@ -6,6 +6,8 @@ use std::path::PathBuf;
 const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 900;
 /// Default cap on concurrent downloads per user (queued + running).
 const DEFAULT_MAX_PER_USER: usize = 2;
+/// Default ceiling on parked waiter tasks (global backpressure bound).
+const DEFAULT_MAX_QUEUED: usize = 20;
 
 /// Runtime configuration, all from environment (see `.env.example`).
 #[derive(Debug, Clone)]
@@ -23,6 +25,8 @@ pub struct Config {
     pub rate_limit: u32,
     /// Max in-flight downloads per user (queued + running count).
     pub max_per_user: usize,
+    /// Max tasks parked on the download semaphore (global backpressure).
+    pub max_queued: usize,
     /// `SQLite` file for the `file_id` cache.
     pub db_path: PathBuf,
     /// Directory for temp downloads (`/tmp/fetchly/{session_id}/`).
@@ -75,6 +79,7 @@ impl Config {
                 .unwrap_or(DEFAULT_DOWNLOAD_TIMEOUT_SECS),
             rate_limit: positive_u32("FETCHLY_RATE_LIMIT").unwrap_or(20),
             max_per_user: positive("FETCHLY_MAX_PER_USER").unwrap_or(DEFAULT_MAX_PER_USER),
+            max_queued: positive("FETCHLY_MAX_QUEUED").unwrap_or(DEFAULT_MAX_QUEUED),
             db_path: vars
                 .get("FETCHLY_DB_PATH")
                 .map_or_else(|| PathBuf::from("./fetchly.db"), PathBuf::from),
@@ -108,6 +113,7 @@ mod tests {
         assert_eq!(cfg.rate_limit, 20);
         assert_eq!(cfg.download_timeout_secs, 900);
         assert_eq!(cfg.max_per_user, 2);
+        assert_eq!(cfg.max_queued, 20);
         assert!(cfg.api_url.is_none());
         assert_eq!(cfg.redis_url, "redis://127.0.0.1:6379");
     }
@@ -120,6 +126,7 @@ mod tests {
             ("FETCHLY_RATE_LIMIT", "5"),
             ("FETCHLY_DOWNLOAD_TIMEOUT_SECS", "300"),
             ("FETCHLY_MAX_PER_USER", "1"),
+            ("FETCHLY_MAX_QUEUED", "50"),
             ("TELEGRAM_API_URL", "http://botapi:8081"),
         ]))
         .expect("config loads");
@@ -127,6 +134,7 @@ mod tests {
         assert_eq!(cfg.rate_limit, 5);
         assert_eq!(cfg.download_timeout_secs, 300);
         assert_eq!(cfg.max_per_user, 1);
+        assert_eq!(cfg.max_queued, 50);
         assert_eq!(cfg.api_url.as_deref(), Some("http://botapi:8081"));
     }
 
@@ -138,12 +146,14 @@ mod tests {
             ("FETCHLY_RATE_LIMIT", "banana"),
             ("FETCHLY_DOWNLOAD_TIMEOUT_SECS", "0"),
             ("FETCHLY_MAX_PER_USER", "0"),
+            ("FETCHLY_MAX_QUEUED", "banana"),
         ]))
         .expect("config loads");
         assert_eq!(cfg.max_workers, 4);
         assert_eq!(cfg.rate_limit, 20);
         assert_eq!(cfg.download_timeout_secs, 900);
         assert_eq!(cfg.max_per_user, 2);
+        assert_eq!(cfg.max_queued, 20);
     }
 
     #[test]
