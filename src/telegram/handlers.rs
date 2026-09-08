@@ -397,6 +397,39 @@ async fn acquire_permit(
     semaphore.clone().acquire_owned().await.ok()
 }
 
+/// Run a pipeline stage against an absolute deadline (whole-pipeline budget:
+/// callers share one deadline across download + convert). On expiry the
+/// stage's token is cancelled — subprocesses die via `kill_on_drop` plus the
+/// explicit kill on cancel, so the awaited future resolves promptly — and the
+/// caller sees [`Error::TimedOut`] instead of [`Error::Cancelled`].
+async fn with_deadline<F, T>(
+    deadline: tokio::time::Instant,
+    timeout_secs: u64,
+    cancel: &CancellationToken,
+    fut: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    tokio::pin!(fut);
+    let mut timed_out = false;
+    let out = tokio::select! {
+        biased;
+        r = &mut fut => r,
+        () = tokio::time::sleep_until(deadline) => {
+            timed_out = true;
+            cancel.cancel();
+            fut.await
+        }
+    };
+    if timed_out {
+        let minutes = (timeout_secs / 60).max(1);
+        tracing::warn!("pipeline stage hit {timeout_secs}s deadline");
+        return Err(Error::TimedOut { minutes });
+    }
+    out
+}
+
 /// Video download pipeline: rate limit → cache → semaphore → yt-dlp → upload.
 #[allow(clippy::too_many_arguments)]
 async fn run_video(
@@ -437,6 +470,10 @@ async fn run_video(
         return;
     };
 
+    // Whole-pipeline budget (download + upload); queued time does not count.
+    let timeout_secs = state.config.download_timeout_secs;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
     let cancel = CancellationToken::new();
     state
         .downloads
@@ -470,7 +507,13 @@ async fn run_video(
         100,
     );
 
-    let download = ytdlp::download_video(&media, quality, &out_path, &cancel, Some(&tx)).await;
+    let download = with_deadline(
+        deadline,
+        timeout_secs,
+        &cancel,
+        ytdlp::download_video(&media, quality, &out_path, &cancel, Some(&tx)),
+    )
+    .await;
     drop(tx);
     let _ = progress_task.await;
     state.downloads.lock().await.remove(&session_id);
@@ -558,7 +601,7 @@ async fn upload_video(
 }
 
 /// Audio pipeline: rate limit → cache → semaphore → yt-dlp → ffmpeg → tag → upload.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_audio(
     bot: Bot,
     chat: ChatId,
@@ -594,6 +637,10 @@ async fn run_audio(
         return;
     };
 
+    // Whole-pipeline budget (download + convert + upload); queued time does not count.
+    let timeout_secs = state.config.download_timeout_secs;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+
     let cancel = CancellationToken::new();
     state
         .downloads
@@ -622,7 +669,13 @@ async fn run_audio(
     let progress_task =
         spawn_progress_forwarder(rx, bot.clone(), chat, progress_msg.id, "⬇️ Downloading", 80);
 
-    let download = ytdlp::download_audio_source(&media, &src_path, &cancel, Some(&tx)).await;
+    let download = with_deadline(
+        deadline,
+        timeout_secs,
+        &cancel,
+        ytdlp::download_audio_source(&media, &src_path, &cancel, Some(&tx)),
+    )
+    .await;
     drop(tx);
     let _ = progress_task.await;
 
@@ -630,7 +683,14 @@ async fn run_audio(
         Err(e) => Err(e),
         Ok(src) => {
             progress_msg_update(&bot, chat, progress_msg.id, "🔄 Converting…").await;
-            if let Err(e) = crate::media::ffmpeg::to_mp3(&src, &mp3_path, quality, &cancel).await {
+            if let Err(e) = with_deadline(
+                deadline,
+                timeout_secs,
+                &cancel,
+                crate::media::ffmpeg::to_mp3(&src, &mp3_path, quality, &cancel),
+            )
+            .await
+            {
                 Err(e)
             } else {
                 tag_downloaded_audio(&session, &mp3_path, &quality_code).await;
@@ -818,5 +878,35 @@ mod tests {
             upload_error_message("Bad Request: chat not found"),
             "Something went wrong. Try again later."
         );
+    }
+
+    #[tokio::test]
+    async fn deadline_passes_through_completed_work() {
+        let cancel = CancellationToken::new();
+        let out = with_deadline(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            900,
+            &cancel,
+            async { Ok::<_, Error>(42) },
+        )
+        .await;
+        assert_eq!(out.unwrap(), 42);
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_cancels_and_reports_timeout() {
+        let cancel = CancellationToken::new();
+        // Mimics the pipeline stages: resolve promptly once cancelled.
+        let fut = async {
+            cancel.cancelled().await;
+            Err::<(), Error>(Error::Cancelled)
+        };
+        let out = with_deadline(tokio::time::Instant::now(), 900, &cancel, fut).await;
+        assert!(cancel.is_cancelled());
+        match out {
+            Err(Error::TimedOut { minutes }) => assert_eq!(minutes, 15),
+            other => panic!("expected TimedOut, got {other:?}"),
+        }
     }
 }

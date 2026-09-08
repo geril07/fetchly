@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 
+/// Default per-download wall-clock budget (15 minutes).
+const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 900;
+
 /// Runtime configuration, all from environment (see `.env.example`).
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -11,6 +14,9 @@ pub struct Config {
     pub api_url: Option<String>,
     /// Max concurrent downloads (global semaphore).
     pub max_workers: usize,
+    /// Max wall-clock seconds for one download pipeline (yt-dlp + convert).
+    /// Queued time does not count; the clock starts at semaphore acquisition.
+    pub download_timeout_secs: u64,
     /// Downloads allowed per user per hour.
     pub rate_limit: u32,
     /// `SQLite` file for the `file_id` cache.
@@ -48,6 +54,11 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .filter(|&n: &u32| n > 0)
         };
+        let positive_u64 = |key: &str| {
+            vars.get(key)
+                .and_then(|v| v.parse().ok())
+                .filter(|&n: &u64| n > 0)
+        };
 
         Ok(Self {
             bot_token,
@@ -56,6 +67,8 @@ impl Config {
                 .filter(|s| !s.trim().is_empty())
                 .cloned(),
             max_workers: positive("FETCHLY_MAX_WORKERS").unwrap_or(4),
+            download_timeout_secs: positive_u64("FETCHLY_DOWNLOAD_TIMEOUT_SECS")
+                .unwrap_or(DEFAULT_DOWNLOAD_TIMEOUT_SECS),
             rate_limit: positive_u32("FETCHLY_RATE_LIMIT").unwrap_or(20),
             db_path: vars
                 .get("FETCHLY_DB_PATH")
@@ -88,6 +101,7 @@ mod tests {
             Config::from_map(&vars(&[("TELEGRAM_BOT_TOKEN", "test-token")])).expect("config loads");
         assert_eq!(cfg.max_workers, 4);
         assert_eq!(cfg.rate_limit, 20);
+        assert_eq!(cfg.download_timeout_secs, 900);
         assert!(cfg.api_url.is_none());
         assert_eq!(cfg.redis_url, "redis://127.0.0.1:6379");
     }
@@ -98,11 +112,13 @@ mod tests {
             ("TELEGRAM_BOT_TOKEN", "t"),
             ("FETCHLY_MAX_WORKERS", "8"),
             ("FETCHLY_RATE_LIMIT", "5"),
+            ("FETCHLY_DOWNLOAD_TIMEOUT_SECS", "300"),
             ("TELEGRAM_API_URL", "http://botapi:8081"),
         ]))
         .expect("config loads");
         assert_eq!(cfg.max_workers, 8);
         assert_eq!(cfg.rate_limit, 5);
+        assert_eq!(cfg.download_timeout_secs, 300);
         assert_eq!(cfg.api_url.as_deref(), Some("http://botapi:8081"));
     }
 
@@ -112,10 +128,12 @@ mod tests {
             ("TELEGRAM_BOT_TOKEN", "t"),
             ("FETCHLY_MAX_WORKERS", "0"),
             ("FETCHLY_RATE_LIMIT", "banana"),
+            ("FETCHLY_DOWNLOAD_TIMEOUT_SECS", "0"),
         ]))
         .expect("config loads");
         assert_eq!(cfg.max_workers, 4);
         assert_eq!(cfg.rate_limit, 20);
+        assert_eq!(cfg.download_timeout_secs, 900);
     }
 
     #[test]

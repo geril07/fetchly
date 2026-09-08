@@ -43,6 +43,9 @@ pub enum Error {
     #[error("cancelled")]
     Cancelled,
 
+    #[error("download timed out after {minutes} minutes")]
+    TimedOut { minutes: u64 },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -61,6 +64,11 @@ impl Error {
             Self::TooLarge => "File exceeds 2 GB limit. Try lower quality.".to_owned(),
             Self::SessionExpired => "Session expired. Send the link again.".to_owned(),
             Self::Cancelled => "Cancelled.".to_owned(),
+            Self::TimedOut { minutes } => {
+                format!(
+                    "Download timed out after {minutes} minutes. Try again or pick a lower quality."
+                )
+            }
             Self::RateLimited {
                 retry_in_secs,
                 remaining: _,
@@ -121,6 +129,10 @@ mod tests {
                 "Session expired. Send the link again.",
             ),
             (Error::Cancelled, "Cancelled."),
+            (
+                Error::TimedOut { minutes: 15 },
+                "Download timed out after 15 minutes. Try again or pick a lower quality.",
+            ),
             (
                 Error::RateLimited {
                     retry_in_secs: 42,
