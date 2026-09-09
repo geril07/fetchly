@@ -62,6 +62,9 @@ async fn main() -> anyhow::Result<()> {
     let state = telegram::AppState::new(config, cache, sessions, limiter, semaphore, http);
     let notify_bot = bot.clone();
 
+    // Register menu commands + profile texts (idempotent, best-effort).
+    telegram::init_telegram(&bot).await;
+
     let mut dispatcher = Dispatcher::builder(bot, telegram::schema())
         .dependencies(dptree::deps![state.clone()])
         .enable_ctrlc_handler()

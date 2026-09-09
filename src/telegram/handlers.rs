@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use teloxide::prelude::*;
 use teloxide::types::{
-    CallbackQuery, ChatId, InlineKeyboardMarkup, InputFile, Message, MessageId, ParseMode,
+    BotCommandScope, CallbackQuery, ChatId, InlineKeyboardMarkup, InputFile, Message, MessageId,
+    ParseMode,
 };
 use teloxide::utils::command::BotCommands;
 use tokio_util::sync::CancellationToken;
@@ -67,15 +68,47 @@ impl AppState {
 }
 
 #[derive(BotCommands, Clone)]
-#[command(rename_rule = "lowercase")]
-enum Command {
+#[command(
+    rename_rule = "lowercase",
+    description = "Fetch videos and audio from links."
+)]
+pub enum Command {
+    #[command(description = "Start the bot and show welcome.")]
     Start,
+    #[command(description = "Show usage guide and limits.")]
     Help,
 }
+
+pub const BOT_DESCRIPTION: &str =
+    "Send me a YouTube, TikTok, Instagram, or X link and I'll fetch the video or audio for you.";
+pub const BOT_SHORT_DESCRIPTION: &str =
+    "Send a link, get video or audio back. YouTube, TikTok, Instagram, X.";
 
 const WELCOME: &str =
     "Send me a YouTube, TikTok, Instagram, or X link and I'll fetch the video or audio for you.";
 const HELP: &str = "Send a link → tap 🎬 Video or 🎵 Audio → pick quality.\n\nCommands:\n/start — welcome\n/help — this guide\n\nLimits: 20 downloads/hour, 2 at a time, 2 GB max file size.";
+
+/// Register menu commands + profile texts. Idempotent, best-effort:
+/// logs a warning on failure, never fails startup (e.g. no network).
+pub async fn init_telegram(bot: &Bot) {
+    if let Err(e) = bot
+        .set_my_commands(Command::bot_commands())
+        .scope(BotCommandScope::AllPrivateChats)
+        .await
+    {
+        tracing::warn!("setMyCommands failed: {e}");
+    }
+    if let Err(e) = bot.set_my_description().description(BOT_DESCRIPTION).await {
+        tracing::warn!("setMyDescription failed: {e}");
+    }
+    if let Err(e) = bot
+        .set_my_short_description()
+        .short_description(BOT_SHORT_DESCRIPTION)
+        .await
+    {
+        tracing::warn!("setMyShortDescription failed: {e}");
+    }
+}
 
 /// Entry point for text messages.
 pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
@@ -1116,5 +1149,24 @@ mod tests {
         assert!(permit.is_some());
         assert_eq!(state.queued.load(Ordering::SeqCst), 0);
         drop(permit);
+    }
+
+    #[test]
+    fn menu_commands_match_handlers() {
+        let cmds = Command::bot_commands();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].command.trim_start_matches('/'), "start");
+        assert_eq!(cmds[1].command.trim_start_matches('/'), "help");
+        assert!(!cmds[0].description.is_empty());
+        assert!(!cmds[1].description.is_empty());
+        let text = Command::descriptions().to_string();
+        assert!(text.contains("/start"));
+        assert!(text.contains("/help"));
+    }
+
+    #[test]
+    fn profile_texts_fit_telegram_limits() {
+        assert!(!BOT_DESCRIPTION.is_empty() && BOT_DESCRIPTION.len() <= 512);
+        assert!(!BOT_SHORT_DESCRIPTION.is_empty() && BOT_SHORT_DESCRIPTION.len() <= 120);
     }
 }
