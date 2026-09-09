@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
 
+# One deploy at a time: a new push cancels the still-running run,
+# so only the newest sha builds and reaches the server.
+concurrency:
+  group: prod-deploy
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/${{ github.repository }}
