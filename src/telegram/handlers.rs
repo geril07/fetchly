@@ -127,14 +127,9 @@ pub enum Command {
     Help,
     #[command(description = "Show your current usage and limits.")]
     Usage,
-    #[command(description = "Change language / Сменить язык.")]
+    #[command(description = "Change interface language.")]
     Language,
 }
-
-pub const BOT_DESCRIPTION: &str =
-    "Send me a YouTube, TikTok, Instagram, or X link and I'll fetch the video or audio for you.";
-pub const BOT_SHORT_DESCRIPTION: &str =
-    "Send a link, get video or audio back. YouTube, TikTok, Instagram, X.";
 
 /// Max file size label from config: Local Bot API unlocks 2 GB, else 50 MB.
 /// Units stay untranslated (shared across locales).
@@ -231,6 +226,10 @@ async fn usage_text(state: &AppState, user_id: u64, lang: Lang) -> String {
 
 /// Register menu commands + profile texts. Idempotent, best-effort:
 /// logs a warning on failure, never fails startup (e.g. no network).
+///
+/// Each item is set twice: the default (English) and the `ru` locale.
+/// Telegram shows the client-language variant in the app menu; chat messages
+/// always follow the `/language` choice, not the menu locale.
 pub async fn init_telegram(bot: &Bot) {
     if let Err(e) = bot
         .set_my_commands(Command::bot_commands())
@@ -239,16 +238,60 @@ pub async fn init_telegram(bot: &Bot) {
     {
         tracing::warn!("setMyCommands failed: {e}");
     }
-    if let Err(e) = bot.set_my_description().description(BOT_DESCRIPTION).await {
-        tracing::warn!("setMyDescription failed: {e}");
-    }
     if let Err(e) = bot
-        .set_my_short_description()
-        .short_description(BOT_SHORT_DESCRIPTION)
+        .set_my_commands(ru_commands())
+        .scope(BotCommandScope::AllPrivateChats)
+        .language_code("ru")
         .await
     {
-        tracing::warn!("setMyShortDescription failed: {e}");
+        tracing::warn!("setMyCommands (ru) failed: {e}");
     }
+    for lang in [Lang::En, Lang::Ru] {
+        let code = match lang {
+            Lang::En => None,
+            Lang::Ru => Some("ru"),
+        };
+        if let Err(e) = set_description(bot, lang, code).await {
+            tracing::warn!("setMyDescription ({lang:?}) failed: {e}");
+        }
+        if let Err(e) = set_short_description(bot, lang, code).await {
+            tracing::warn!("setMyShortDescription ({lang:?}) failed: {e}");
+        }
+    }
+}
+
+/// Russian menu commands. Names stay Latin (Telegram requires
+/// `[a-z0-9_]`); only descriptions are translated.
+fn ru_commands() -> Vec<teloxide::types::BotCommand> {
+    use teloxide::types::BotCommand;
+    vec![
+        BotCommand::new("start", i18n::cmd_start_desc(Lang::Ru)),
+        BotCommand::new("help", i18n::cmd_help_desc(Lang::Ru)),
+        BotCommand::new("usage", i18n::cmd_usage_desc(Lang::Ru)),
+        BotCommand::new("language", i18n::cmd_language_desc(Lang::Ru)),
+    ]
+}
+
+async fn set_description(bot: &Bot, lang: Lang, code: Option<&str>) -> Result<()> {
+    let mut req = bot
+        .set_my_description()
+        .description(i18n::bot_description(lang));
+    if let Some(code) = code {
+        req = req.language_code(code);
+    }
+    req.await?;
+    Ok(())
+}
+
+async fn set_short_description(bot: &Bot, lang: Lang, code: Option<&str>) -> Result<()> {
+    let mut req = bot
+        .set_my_short_description()
+        .short_description(i18n::bot_short_description(lang));
+    if let Some(code) = code {
+        req = req.language_code(code);
+    }
+    req.await?;
+    Ok(())
 }
 
 /// Reply with the sender's usage, or a fallback when Telegram omits the
@@ -1590,9 +1633,35 @@ mod tests {
     }
 
     #[test]
-    fn profile_texts_fit_telegram_limits() {
-        assert!(!BOT_DESCRIPTION.is_empty() && BOT_DESCRIPTION.len() <= 512);
-        assert!(!BOT_SHORT_DESCRIPTION.is_empty() && BOT_SHORT_DESCRIPTION.len() <= 120);
+    fn menu_commands_match_i18n() {
+        // The derive-macro descriptions are the English menu: they must not
+        // drift from `i18n` (the `ru` menu is built from `i18n` directly).
+        let cmds = Command::bot_commands();
+        let want = [
+            i18n::cmd_start_desc(Lang::En),
+            i18n::cmd_help_desc(Lang::En),
+            i18n::cmd_usage_desc(Lang::En),
+            i18n::cmd_language_desc(Lang::En),
+        ];
+        for (cmd, desc) in cmds.iter().zip(want) {
+            assert_eq!(cmd.description, desc);
+        }
+    }
+
+    #[test]
+    fn ru_menu_names_are_valid_commands() {
+        // Telegram command names: 1–32 chars of a-z, 0-9, underscore.
+        for cmd in ru_commands() {
+            assert!((1..=32).contains(&cmd.command.len()), "{}", cmd.command);
+            assert!(
+                cmd.command
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "{}",
+                cmd.command
+            );
+            assert!(!cmd.description.is_empty(), "{}", cmd.command);
+        }
     }
 
     fn flight_key(hash: &str, format: &str, quality: &str) -> FlightKey {

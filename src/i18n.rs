@@ -529,6 +529,64 @@ pub fn error_generic(lang: Lang) -> &'static str {
     }
 }
 
+/// Bot profile description (`setMyDescription`, ≤512 chars).
+#[must_use]
+pub fn bot_description(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => {
+            "Send me a YouTube, TikTok, Instagram, or X link and I'll fetch the video or audio for you."
+        }
+        Lang::Ru => {
+            "Пришли мне ссылку на YouTube, TikTok, Instagram или X — верну видео или аудио."
+        }
+    }
+}
+
+/// Bot profile short description (`setMyShortDescription`, ≤120 chars).
+#[must_use]
+pub fn bot_short_description(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "Send a link, get video or audio back. YouTube, TikTok, Instagram, X.",
+        Lang::Ru => "Ссылка → видео или аудио. YouTube, TikTok, Instagram, X.",
+    }
+}
+
+/// Menu (`setMyCommands`) description for `/start` (3–256 chars).
+#[must_use]
+pub fn cmd_start_desc(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "Start the bot and show welcome.",
+        Lang::Ru => "Запустить бота и показать приветствие.",
+    }
+}
+
+/// Menu (`setMyCommands`) description for `/help` (3–256 chars).
+#[must_use]
+pub fn cmd_help_desc(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "Show usage guide and limits.",
+        Lang::Ru => "Показать справку и лимиты.",
+    }
+}
+
+/// Menu (`setMyCommands`) description for `/usage` (3–256 chars).
+#[must_use]
+pub fn cmd_usage_desc(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "Show your current usage and limits.",
+        Lang::Ru => "Показать использование и лимиты.",
+    }
+}
+
+/// Menu (`setMyCommands`) description for `/language` (3–256 chars).
+#[must_use]
+pub fn cmd_language_desc(lang: Lang) -> &'static str {
+    match lang {
+        Lang::En => "Change interface language.",
+        Lang::Ru => "Сменить язык интерфейса.",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,8 +686,34 @@ mod tests {
                 assert!(!error_timed_out(lang, 15).is_empty());
                 assert!(!error_too_many_concurrent(lang, 2).is_empty());
                 assert!(!error_generic(lang).is_empty());
+                assert!(!bot_description(lang).is_empty());
+                assert!(!bot_short_description(lang).is_empty());
+                assert!(!cmd_start_desc(lang).is_empty());
+                assert!(!cmd_help_desc(lang).is_empty());
+                assert!(!cmd_usage_desc(lang).is_empty());
+                assert!(!cmd_language_desc(lang).is_empty());
             }
         }
         assert!(!language_prompt().is_empty());
+    }
+
+    #[test]
+    fn profile_texts_fit_telegram_limits() {
+        // Telegram counts characters, not bytes — Cyrillic is 2 bytes in UTF-8.
+        for lang in [Lang::En, Lang::Ru] {
+            let desc = bot_description(lang);
+            assert!(!desc.is_empty() && desc.chars().count() <= 512, "{desc}");
+            let short = bot_short_description(lang);
+            assert!(!short.is_empty() && short.chars().count() <= 120, "{short}");
+            for cmd in [
+                cmd_start_desc(lang),
+                cmd_help_desc(lang),
+                cmd_usage_desc(lang),
+                cmd_language_desc(lang),
+            ] {
+                let n = cmd.chars().count();
+                assert!((3..=256).contains(&n), "{cmd}");
+            }
+        }
     }
 }
