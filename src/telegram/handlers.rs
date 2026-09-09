@@ -113,6 +113,8 @@ pub enum Command {
     Start,
     #[command(description = "Show usage guide and limits.")]
     Help,
+    #[command(description = "Show your current usage and limits.")]
+    Usage,
 }
 
 pub const BOT_DESCRIPTION: &str =
@@ -122,7 +124,80 @@ pub const BOT_SHORT_DESCRIPTION: &str =
 
 const WELCOME: &str =
     "Send me a YouTube, TikTok, Instagram, or X link and I'll fetch the video or audio for you.";
-const HELP: &str = "Send a link → tap 🎬 Video or 🎵 Audio → pick quality.\n\nCommands:\n/start — welcome\n/help — this guide\n\nLimits: 20 downloads/hour, 2 at a time, 2 GB max file size.";
+
+/// Max file size label from config: Local Bot API unlocks 2 GB, else 50 MB.
+fn upload_limit_label(config: &Config) -> &'static str {
+    if config.api_url.is_some() {
+        "2 GB"
+    } else {
+        "50 MB"
+    }
+}
+
+/// Help text built from live config (rate, concurrency, upload cap).
+fn help_text(config: &Config) -> String {
+    format!(
+        "Send a link → tap 🎬 Video or 🎵 Audio → pick quality.\n\nCommands:\n/start — welcome\n/help — this guide\n/usage — your current usage\n\nLimits: {} downloads/hour, {} at a time, {} max file size.",
+        config.rate_limit,
+        config.max_per_user,
+        upload_limit_label(config)
+    )
+}
+
+/// Human-readable duration: `45s`, `2m 5s`, `1h 3m`.
+fn format_duration(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        if m > 0 {
+            format!("{h}h {m}m")
+        } else {
+            format!("{h}h")
+        }
+    } else if m > 0 {
+        if s > 0 {
+            format!("{m}m {s}s")
+        } else {
+            format!("{m}m")
+        }
+    } else {
+        format!("{s}s")
+    }
+}
+
+/// User-facing usage snapshot: hourly quota + reset + slots + file cap.
+/// Read-only: never consumes rate-limit quota.
+async fn usage_text(state: &AppState, user_id: u64) -> String {
+    let slots = state
+        .user_slots
+        .lock()
+        .await
+        .get(&user_id)
+        .copied()
+        .unwrap_or(0);
+    match state.limiter.usage(user_id).await {
+        Ok(u) => {
+            let reset = if u.reset_in_secs == 0 {
+                "full quota".to_owned()
+            } else {
+                format!("in {}", format_duration(u.reset_in_secs))
+            };
+            format!(
+                "📊 Usage\n\nDownloads this hour: {}/{} used ({} left)\nReset: {reset}\nConcurrent downloads: {slots}/{}\nMax file size: {}",
+                u.used,
+                state.config.rate_limit,
+                u.remaining,
+                state.config.max_per_user,
+                upload_limit_label(&state.config)
+            )
+        }
+        Err(e) => {
+            tracing::warn!("usage lookup failed: {e}");
+            "Could not load usage. Try again later.".to_owned()
+        }
+    }
+}
 
 /// Register menu commands + profile texts. Idempotent, best-effort:
 /// logs a warning on failure, never fails startup (e.g. no network).
@@ -146,6 +221,22 @@ pub async fn init_telegram(bot: &Bot) {
     }
 }
 
+/// Reply with the sender's usage, or a fallback when Telegram omits the
+/// sender (e.g. channel posts). Never attributes quota to a shared id.
+async fn reply_usage(bot: &Bot, msg: &Message, state: &AppState) -> Result<()> {
+    let Some(user) = msg.from.as_ref() else {
+        bot.send_message(
+            msg.chat.id,
+            "Can't tell who sent that. Usage is available from your own account.",
+        )
+        .await?;
+        return Ok(());
+    };
+    bot.send_message(msg.chat.id, usage_text(state, user.id.0).await)
+        .await?;
+    Ok(())
+}
+
 /// Entry point for text messages.
 pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
     let Some(text) = msg.text() else {
@@ -153,20 +244,32 @@ pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<(
     };
 
     if let Ok(cmd) = Command::parse(text, "fetchly") {
-        let reply = match cmd {
-            Command::Start => WELCOME,
-            Command::Help => HELP,
-        };
-        bot.send_message(msg.chat.id, reply).await?;
+        match cmd {
+            Command::Start => {
+                bot.send_message(msg.chat.id, WELCOME).await?;
+            }
+            Command::Help => {
+                bot.send_message(msg.chat.id, help_text(&state.config))
+                    .await?;
+            }
+            Command::Usage => {
+                reply_usage(&bot, &msg, &state).await?;
+            }
+        }
         return Ok(());
     }
-    // Also handle bare `/start`/`/help` with bot username suffix.
+    // Also handle bare `/start`/`/help`/`/usage` with bot username suffix.
     if text.starts_with("/start") {
         bot.send_message(msg.chat.id, WELCOME).await?;
         return Ok(());
     }
     if text.starts_with("/help") {
-        bot.send_message(msg.chat.id, HELP).await?;
+        bot.send_message(msg.chat.id, help_text(&state.config))
+            .await?;
+        return Ok(());
+    }
+    if text.starts_with("/usage") {
+        reply_usage(&bot, &msg, &state).await?;
         return Ok(());
     }
 
@@ -1311,14 +1414,17 @@ mod tests {
     #[test]
     fn menu_commands_match_handlers() {
         let cmds = Command::bot_commands();
-        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds.len(), 3);
         assert_eq!(cmds[0].command.trim_start_matches('/'), "start");
         assert_eq!(cmds[1].command.trim_start_matches('/'), "help");
+        assert_eq!(cmds[2].command.trim_start_matches('/'), "usage");
         assert!(!cmds[0].description.is_empty());
         assert!(!cmds[1].description.is_empty());
+        assert!(!cmds[2].description.is_empty());
         let text = Command::descriptions().to_string();
         assert!(text.contains("/start"));
         assert!(text.contains("/help"));
+        assert!(text.contains("/usage"));
     }
 
     #[test]
@@ -1372,5 +1478,74 @@ mod tests {
         }
         assert_eq!(leaders, 1, "10 concurrent taps = 1 download");
         assert_eq!(flights.finish(&key).await.len(), 9);
+    }
+
+    fn test_config(rate_limit: u32, max_per_user: usize, api_url: Option<&str>) -> Config {
+        Config {
+            bot_token: "test".to_owned(),
+            api_url: api_url.map(str::to_owned),
+            max_workers: 4,
+            download_timeout_secs: 900,
+            rate_limit,
+            max_per_user,
+            max_queued: 20,
+            db_path: std::path::PathBuf::from(":memory:"),
+            temp_dir: std::path::PathBuf::from("/tmp/fetchly-test"),
+            redis_url: String::new(),
+        }
+    }
+
+    #[test]
+    fn help_reflects_upload_cap() {
+        let std = help_text(&test_config(20, 2, None));
+        assert!(std.contains("20 downloads/hour"), "{std}");
+        assert!(std.contains("2 at a time"), "{std}");
+        assert!(std.contains("50 MB max file size"), "{std}");
+        assert!(std.contains("/usage"), "{std}");
+
+        let local = help_text(&test_config(5, 1, Some("http://botapi:8081")));
+        assert!(local.contains("5 downloads/hour"), "{local}");
+        assert!(local.contains("1 at a time"), "{local}");
+        assert!(local.contains("2 GB max file size"), "{local}");
+    }
+
+    #[test]
+    fn durations_are_human_readable() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(60), "1m");
+        assert_eq!(format_duration(125), "2m 5s");
+        assert_eq!(format_duration(3600), "1h");
+        assert_eq!(format_duration(3720), "1h 2m");
+    }
+
+    #[tokio::test]
+    async fn usage_shows_quota_slots_and_cap() {
+        let Some(t) = crate::testutil::start_redis().await else {
+            return;
+        };
+        let state = AppState::new(
+            test_config(20, 2, None),
+            FileCache::open_in_memory().expect("cache"),
+            SessionStore::new(t.manager.clone()),
+            RateLimiter::new(t.manager.clone(), 20),
+            Arc::new(tokio::sync::Semaphore::new(2)),
+            reqwest::Client::new(),
+        );
+        let fresh = usage_text(&state, 9001).await;
+        assert!(fresh.contains("0/20 used (20 left)"), "{fresh}");
+        assert!(fresh.contains("0/2"), "{fresh}");
+        assert!(fresh.contains("50 MB"), "{fresh}");
+
+        state
+            .limiter
+            .check_and_consume(9001)
+            .await
+            .expect("consume");
+        state.user_slots.lock().await.insert(9001, 1);
+        let used = usage_text(&state, 9001).await;
+        assert!(used.contains("1/20 used (19 left)"), "{used}");
+        assert!(used.contains("1/2"), "{used}");
+        assert!(used.contains("Reset: in "), "{used}");
     }
 }
