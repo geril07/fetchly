@@ -39,6 +39,8 @@ pub struct AppState {
     /// Tasks currently inside semaphore admission (parked waiters + handoff).
     /// Global backpressure bound; decremented right after a permit is granted.
     pub queued: Arc<AtomicUsize>,
+    /// Singleflight registry: identical concurrent taps share one download.
+    pub flights: Flights,
     pub http: reqwest::Client,
 }
 
@@ -62,8 +64,42 @@ impl AppState {
             notify: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             user_slots: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             queued: Arc::new(AtomicUsize::new(0)),
+            flights: Flights::default(),
             http,
         }
+    }
+}
+
+/// Singleflight key: same URL + format + quality tapped twice concurrently
+/// downloads once; latecomers attach and get the finished file.
+pub type FlightKey = (String, String, String);
+
+/// One in-flight download shared by identical concurrent taps:
+/// the first tapper (leader) runs the pipeline, the rest (waiters) get the
+/// finished `file_id` fanned out to their chats. Pure in-memory, no Redis.
+#[derive(Clone, Default)]
+pub struct Flights(Arc<tokio::sync::Mutex<HashMap<FlightKey, Vec<ChatId>>>>);
+
+impl Flights {
+    /// Register interest in a download. Returns `true` for the leader (runs
+    /// the pipeline), `false` for a waiter (waits for fan-out). Atomic under
+    /// the map lock, so simultaneous taps elect exactly one leader.
+    pub async fn attach_or_lead(&self, key: &FlightKey, chat: ChatId) -> bool {
+        let mut flights = self.0.lock().await;
+        if let Some(waiters) = flights.get_mut(key) {
+            waiters.push(chat);
+            false
+        } else {
+            flights.insert(key.clone(), Vec::new());
+            true
+        }
+    }
+
+    /// Leader done: drop the entry and hand over waiter chats for fan-out.
+    /// A tap arriving after this becomes a new leader (and normally hits the
+    /// `file_id` cache instantly, since the leader caches before finishing).
+    pub async fn finish(&self, key: &FlightKey) -> Vec<ChatId> {
+        self.0.lock().await.remove(key).unwrap_or_default()
     }
 }
 
@@ -561,6 +597,63 @@ async fn release_user_slot(state: &AppState, user_id: u64) {
     }
 }
 
+/// Note shown to a tapper attaching to an already-running identical download.
+/// Waiters hold no worker and no user slot; the leader fans the file out.
+const FLIGHT_WAIT_NOTE: &str = "⏳ Already downloading — I'll send it here when it's ready.";
+
+/// Leader gave up before producing a file (admission/progress failure):
+/// waiters must re-tap, the flight is gone.
+const FLIGHT_RETRY_NOTE: &str = "The download didn't start. Please tap the quality again.";
+
+/// Leader cancelled: waiters didn't cancel anything, say so plainly.
+const FLIGHT_CANCELLED_NOTE: &str = "The download was cancelled.";
+
+/// Fallback when the upload failed without a mappable message.
+const FLIGHT_FAILED_NOTE: &str = "Something went wrong. Try again later.";
+
+/// Leader done: unregister the flight and send the finished file to every
+/// attached waiter chat. Best-effort per chat; failures are logged.
+async fn fan_out_file(
+    bot: &Bot,
+    state: &AppState,
+    key: &FlightKey,
+    format: &str,
+    title: &str,
+    file_id: &str,
+) {
+    for chat in state.flights.finish(key).await {
+        let res = if format == "video" {
+            bot.send_video(
+                chat,
+                InputFile::file_id(teloxide::types::FileId(file_id.to_owned())),
+            )
+            .caption(title.to_owned())
+            .await
+            .map(|_| ())
+        } else {
+            bot.send_audio(
+                chat,
+                InputFile::file_id(teloxide::types::FileId(file_id.to_owned())),
+            )
+            .title(title.to_owned())
+            .await
+            .map(|_| ())
+        };
+        if let Err(e) = res {
+            tracing::warn!("singleflight fan-out to {chat} failed: {e}");
+        }
+    }
+}
+
+/// Leader failed or gave up: unregister the flight and notify waiter chats.
+async fn fan_out_notice(bot: &Bot, state: &AppState, key: &FlightKey, notice: &str) {
+    for chat in state.flights.finish(key).await {
+        if let Err(e) = bot.send_message(chat, notice).await {
+            tracing::warn!("singleflight notice to {chat} failed: {e}");
+        }
+    }
+}
+
 /// Video download pipeline: rate limit → cache → semaphore → yt-dlp → upload.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_video(
@@ -609,12 +702,26 @@ async fn run_video(
         return;
     }
 
+    // Singleflight: an identical download already running serves this tap.
+    // Waiters hold no worker and no user slot; the leader fans the file out.
+    let flight_key = (
+        session.url_hash.clone(),
+        "video".to_owned(),
+        quality_code.clone(),
+    );
+    if !state.flights.attach_or_lead(&flight_key, chat).await {
+        release_user_slot(&state, user_id).await;
+        let _ = bot.send_message(chat, FLIGHT_WAIT_NOTE).await;
+        return;
+    }
+
     // Queue when all workers are busy.
     // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
     let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state).await else {
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
+        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
         return;
     };
 
@@ -637,6 +744,7 @@ async fn run_video(
         state.downloads.lock().await.remove(&session_id);
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
+        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
         return;
     };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
@@ -676,13 +784,14 @@ async fn run_video(
                 .edit_message_text(chat, progress_msg.id, "Cancelled.")
                 .await;
             cleanup(&work_dir).await;
+            fan_out_notice(&bot, &state, &flight_key, FLIGHT_CANCELLED_NOTE).await;
         }
         Err(e) => {
             tracing::warn!("video download failed: {e}");
-            let _ = bot
-                .edit_message_text(chat, progress_msg.id, e.user_message())
-                .await;
+            let text = e.user_message();
+            let _ = bot.edit_message_text(chat, progress_msg.id, &text).await;
             cleanup(&work_dir).await;
+            fan_out_notice(&bot, &state, &flight_key, &text).await;
         }
         Ok(path) => {
             if exceeds_standard_limit(&path).await && state.config.api_url.is_none() {
@@ -690,9 +799,10 @@ async fn run_video(
                     .edit_message_text(chat, progress_msg.id, OVER_LIMIT_MSG)
                     .await;
                 cleanup(&work_dir).await;
+                fan_out_notice(&bot, &state, &flight_key, OVER_LIMIT_MSG).await;
                 return;
             }
-            upload_video(
+            let file_id = upload_video(
                 &bot,
                 chat,
                 progress_msg.id,
@@ -703,11 +813,28 @@ async fn run_video(
             )
             .await;
             cleanup(&work_dir).await;
+            match file_id {
+                Some(fid) => {
+                    fan_out_file(
+                        &bot,
+                        &state,
+                        &flight_key,
+                        "video",
+                        &session.metadata.title,
+                        &fid,
+                    )
+                    .await;
+                }
+                None => {
+                    fan_out_notice(&bot, &state, &flight_key, FLIGHT_FAILED_NOTE).await;
+                }
+            }
         }
     }
 }
 
 /// Upload a finished video file, cache its `file_id`.
+/// Returns the `file_id` on success so the singleflight leader can fan it out.
 async fn upload_video(
     bot: &Bot,
     chat: ChatId,
@@ -716,7 +843,7 @@ async fn upload_video(
     session: &StoredSession,
     quality: VideoQuality,
     state: &AppState,
-) {
+) -> Option<String> {
     progress_msg_update(bot, chat, progress_msg, "🔄 Uploading…").await;
     let caption = format!(
         "{}\n{} · {}",
@@ -730,24 +857,22 @@ async fn upload_video(
         .await
     {
         Ok(sent) => {
-            if let Some(video) = sent.video() {
+            let file_id = sent.video().map(|v| v.file.id.to_string());
+            if let Some(fid) = &file_id {
                 let _ = state
                     .cache
-                    .set(
-                        &session.url_hash,
-                        "video",
-                        quality.as_str(),
-                        &video.file.id.to_string(),
-                    )
+                    .set(&session.url_hash, "video", quality.as_str(), fid)
                     .await;
             }
             let _ = bot.delete_message(chat, progress_msg).await;
+            file_id
         }
         Err(e) => {
             tracing::warn!("send_video failed: {e}");
             let _ = bot
                 .edit_message_text(chat, progress_msg, upload_error_message(&e.to_string()))
                 .await;
+            None
         }
     }
 }
@@ -798,11 +923,25 @@ async fn run_audio(
         return;
     }
 
+    // Singleflight: an identical download already running serves this tap.
+    // Waiters hold no worker and no user slot; the leader fans the file out.
+    let flight_key = (
+        session.url_hash.clone(),
+        "audio".to_owned(),
+        quality_code.clone(),
+    );
+    if !state.flights.attach_or_lead(&flight_key, chat).await {
+        release_user_slot(&state, user_id).await;
+        let _ = bot.send_message(chat, FLIGHT_WAIT_NOTE).await;
+        return;
+    }
+
     // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
     let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state).await else {
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
+        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
         return;
     };
 
@@ -825,6 +964,7 @@ async fn run_audio(
         state.downloads.lock().await.remove(&session_id);
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
+        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
         return;
     };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
@@ -879,13 +1019,14 @@ async fn run_audio(
                 .edit_message_text(chat, progress_msg.id, "Cancelled.")
                 .await;
             cleanup(&work_dir).await;
+            fan_out_notice(&bot, &state, &flight_key, FLIGHT_CANCELLED_NOTE).await;
         }
         Err(e) => {
             tracing::warn!("audio pipeline failed: {e}");
-            let _ = bot
-                .edit_message_text(chat, progress_msg.id, e.user_message())
-                .await;
+            let text = e.user_message();
+            let _ = bot.edit_message_text(chat, progress_msg.id, &text).await;
             cleanup(&work_dir).await;
+            fan_out_notice(&bot, &state, &flight_key, &text).await;
         }
         Ok(path) => {
             if exceeds_standard_limit(&path).await && state.config.api_url.is_none() {
@@ -893,9 +1034,10 @@ async fn run_audio(
                     .edit_message_text(chat, progress_msg.id, OVER_LIMIT_MSG)
                     .await;
                 cleanup(&work_dir).await;
+                fan_out_notice(&bot, &state, &flight_key, OVER_LIMIT_MSG).await;
                 return;
             }
-            upload_audio(
+            let file_id = upload_audio(
                 &bot,
                 chat,
                 progress_msg.id,
@@ -906,11 +1048,28 @@ async fn run_audio(
             )
             .await;
             cleanup(&work_dir).await;
+            match file_id {
+                Some(fid) => {
+                    fan_out_file(
+                        &bot,
+                        &state,
+                        &flight_key,
+                        "audio",
+                        &session.metadata.title,
+                        &fid,
+                    )
+                    .await;
+                }
+                None => {
+                    fan_out_notice(&bot, &state, &flight_key, FLIGHT_FAILED_NOTE).await;
+                }
+            }
         }
     }
 }
 
 /// Upload a finished `MP3`, cache its `file_id`, and retire the progress message.
+/// Returns the `file_id` on success so the singleflight leader can fan it out.
 async fn upload_audio(
     bot: &Bot,
     chat: ChatId,
@@ -919,7 +1078,7 @@ async fn upload_audio(
     session: &StoredSession,
     quality: AudioQuality,
     state: &AppState,
-) {
+) -> Option<String> {
     progress_msg_update(bot, chat, progress_msg, "⬆️ Uploading…").await;
     let mut req = bot
         .send_audio(chat, InputFile::file(path.to_owned()))
@@ -936,24 +1095,22 @@ async fn upload_audio(
     }
     match req.await {
         Ok(sent) => {
-            if let Some(audio) = sent.audio() {
+            let file_id = sent.audio().map(|a| a.file.id.to_string());
+            if let Some(fid) = &file_id {
                 let _ = state
                     .cache
-                    .set(
-                        &session.url_hash,
-                        "audio",
-                        quality.as_str(),
-                        &audio.file.id.to_string(),
-                    )
+                    .set(&session.url_hash, "audio", quality.as_str(), fid)
                     .await;
             }
             let _ = bot.delete_message(chat, progress_msg).await;
+            file_id
         }
         Err(e) => {
             tracing::warn!("send_audio failed: {e}");
             let _ = bot
                 .edit_message_text(chat, progress_msg, upload_error_message(&e.to_string()))
                 .await;
+            None
         }
     }
 }
@@ -1168,5 +1325,52 @@ mod tests {
     fn profile_texts_fit_telegram_limits() {
         assert!(!BOT_DESCRIPTION.is_empty() && BOT_DESCRIPTION.len() <= 512);
         assert!(!BOT_SHORT_DESCRIPTION.is_empty() && BOT_SHORT_DESCRIPTION.len() <= 120);
+    }
+
+    fn flight_key(hash: &str, format: &str, quality: &str) -> FlightKey {
+        (hash.to_owned(), format.to_owned(), quality.to_owned())
+    }
+
+    #[tokio::test]
+    async fn flight_first_tapper_leads_rest_wait() {
+        let flights = Flights::default();
+        let key = flight_key("hash", "video", "720");
+        assert!(flights.attach_or_lead(&key, ChatId(1)).await);
+        assert!(!flights.attach_or_lead(&key, ChatId(2)).await);
+        // Different qualities still download independently.
+        let other = flight_key("hash", "video", "1080");
+        assert!(flights.attach_or_lead(&other, ChatId(3)).await);
+    }
+
+    #[tokio::test]
+    async fn flight_finish_hands_over_waiters_and_releases_key() {
+        let flights = Flights::default();
+        let key = flight_key("hash", "audio", "320");
+        assert!(flights.attach_or_lead(&key, ChatId(1)).await);
+        assert!(!flights.attach_or_lead(&key, ChatId(2)).await);
+        assert!(!flights.attach_or_lead(&key, ChatId(3)).await);
+        assert_eq!(flights.finish(&key).await, vec![ChatId(2), ChatId(3)]);
+        // Key released: the next tapper leads again.
+        assert!(flights.attach_or_lead(&key, ChatId(4)).await);
+    }
+
+    #[tokio::test]
+    async fn flight_concurrent_taps_elect_exactly_one_leader() {
+        let flights = Flights::default();
+        let key = flight_key("hash", "video", "720");
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..10 {
+            let registry = flights.clone();
+            let tapped = key.clone();
+            set.spawn(async move { registry.attach_or_lead(&tapped, ChatId(i)).await });
+        }
+        let mut leaders = 0;
+        while let Some(res) = set.join_next().await {
+            if res.expect("tap task") {
+                leaders += 1;
+            }
+        }
+        assert_eq!(leaders, 1, "10 concurrent taps = 1 download");
+        assert_eq!(flights.finish(&key).await.len(), 9);
     }
 }
