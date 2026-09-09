@@ -44,11 +44,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - uses: docker/setup-buildx-action@v4
+
       - uses: docker/build-push-action@v7
         with:
           context: .
           push: true
           tags: ${{ env.IMAGE }}:latest
+          # Registry cache: no GHA-cache quota pressure (rust-cache lives
+          # there), free on GHCR for a public repo. mode=max keeps the
+          # cargo-chef intermediate stages, so dep compiles are reused.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
 
       - name: Deploy to server
         # NOTE: the server locks this key to /opt/fetchly/deploy.sh via
