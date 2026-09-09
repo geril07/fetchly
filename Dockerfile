@@ -23,9 +23,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 # yt-dlp standalone binary (bundles its own Python; no pip/PEP 668 issues).
-# Rebuild regularly — extractors rot within weeks on stale builds.
-ARG YT_DLP_VERSION=latest
-RUN curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/${YT_DLP_VERSION}/download/yt-dlp_linux" \
+# Pinned: the layer is cached, so `latest` would silently go stale while
+# extractors rot within weeks. Bump the version to pull a fresh binary.
+ARG YT_DLP_VERSION=2026.08.19
+RUN curl -fsSL "https://github.com/yt-dlp/yt-dlp/releases/download/${YT_DLP_VERSION}/yt-dlp_linux" \
         -o /usr/local/bin/yt-dlp \
     && chmod +x /usr/local/bin/yt-dlp \
     && yt-dlp --version
