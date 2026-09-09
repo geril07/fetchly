@@ -2,13 +2,8 @@ use redis::AsyncCommands;
 
 use crate::error::{Error, Result};
 
-/// Per-user download rate limiting: N downloads per rolling hour.
-///
-/// Atomic check-then-consume via a Lua script on `fetchly:ratelimit:{user_id}`.
-/// The key holds the count for the current window; TTL is the seconds left.
-/// Rejected taps never increment the counter, so failed admission does not
-/// burn quota. Call [`RateLimiter::refund`] to give back a unit consumed
-/// before an admission failure further down the pipeline.
+/// Atomic check-then-consume via Lua on `fetchly:ratelimit:{user_id}`.
+/// Rejected taps leave the counter untouched; refund only post-consume admission failures.
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
     manager: redis::aio::ConnectionManager,
@@ -27,8 +22,7 @@ impl RateLimiter {
         format!("fetchly:ratelimit:{user_id}")
     }
 
-    /// Read-only view of a user's current window. Never consumes quota.
-    /// Returns used count, remaining quota, and seconds until reset (0 = full quota).
+    /// Read-only; never consumes quota.
     pub async fn usage(&self, user_id: u64) -> Result<Usage> {
         let mut conn = self.manager.clone();
         let key = Self::key(user_id);
@@ -56,10 +50,7 @@ impl RateLimiter {
         })
     }
 
-    /// Consume one unit. On success returns remaining quota in the window.
-    /// On exhaustion returns [`Error::RateLimited`] with TTL-based retry hint.
-    /// The check and the increment run atomically: a rejected tap leaves the
-    /// counter untouched, so callers can try-then-give-up without a refund.
+    /// On exhaustion returns [`Error::RateLimited`] with a TTL-based retry hint.
     pub async fn check_and_consume(&self, user_id: u64) -> Result<u32> {
         let max = i64::from(self.max_per_hour);
         let script = redis::Script::new(
@@ -91,11 +82,7 @@ impl RateLimiter {
         Ok(remaining)
     }
 
-    /// Give back one unit previously consumed by [`RateLimiter::check_and_consume`].
-    /// Used when admission fails *after* the consume step (global queue full,
-    /// progress message send failure). Never drops the counter below zero;
-    /// deleting the key at zero restores the fresh-window state. TTL of a
-    /// non-empty window is preserved.
+    /// Give back a unit consumed before a post-consume admission failure. Never drops below zero.
     pub async fn refund(&self, user_id: u64) -> Result<()> {
         let script = redis::Script::new(
             r"
@@ -116,7 +103,6 @@ impl RateLimiter {
     }
 }
 
-/// Snapshot of one user's rate-limit window (see [`RateLimiter::usage`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Usage {
     pub used: u32,
@@ -176,7 +162,6 @@ mod tests {
         assert_eq!(mid.used, 2);
         assert_eq!(mid.remaining, 1);
         assert!(mid.reset_in_secs > 0 && mid.reset_in_secs <= 3600);
-        // Peek again: still 2 used, quota untouched.
         let again = limiter.usage(3001).await.expect("peek");
         assert_eq!(again.used, 2);
         assert_eq!(again.remaining, 1);
@@ -191,7 +176,6 @@ mod tests {
         assert_eq!(limiter.check_and_consume(2001).await.expect("A1"), 1);
         assert_eq!(limiter.check_and_consume(2001).await.expect("A2"), 0);
         assert!(limiter.check_and_consume(2001).await.is_err());
-        // B is unaffected by A's exhaustion.
         assert_eq!(limiter.check_and_consume(2002).await.expect("B1"), 1);
     }
 

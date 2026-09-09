@@ -3,7 +3,6 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 use crate::i18n::Lang;
 use crate::media::ytdlp::Metadata;
 
-/// Preview card buttons: `[🎬 Video] [🎵 Audio]`.
 #[must_use]
 pub fn preview_keyboard(session_id: &str, lang: Lang) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([[
@@ -18,7 +17,6 @@ pub fn preview_keyboard(session_id: &str, lang: Lang) -> InlineKeyboardMarkup {
     ]])
 }
 
-/// Quality picker for video. Each button shows `720p — ~42 MB` when known.
 #[must_use]
 pub fn video_quality_keyboard(
     meta: &Metadata,
@@ -46,7 +44,6 @@ pub fn video_quality_keyboard(
     InlineKeyboardMarkup::new(rows)
 }
 
-/// Quality picker for audio.
 #[must_use]
 pub fn audio_quality_keyboard(
     meta: &Metadata,
@@ -74,7 +71,6 @@ pub fn audio_quality_keyboard(
     InlineKeyboardMarkup::new(rows)
 }
 
-/// Single cancel button shown under the progress message during download.
 #[must_use]
 pub fn cancel_keyboard(session_id: &str, lang: Lang) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([[InlineKeyboardButton::callback(
@@ -83,7 +79,6 @@ pub fn cancel_keyboard(session_id: &str, lang: Lang) -> InlineKeyboardMarkup {
     )]])
 }
 
-/// Language picker for `/language`: `[English] [Русский]`.
 #[must_use]
 pub fn language_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([
@@ -92,8 +87,6 @@ pub fn language_keyboard() -> InlineKeyboardMarkup {
     ])
 }
 
-/// Human-readable byte count: `42 MB`, `3.1 GB`, `512 KB`.
-///
 /// Integer math only — no float precision loss even for huge files.
 #[must_use]
 pub fn format_bytes(bytes: u64) -> String {
@@ -111,7 +104,6 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Preview card text: `{title}\n{duration} · {platform} · {views}`.
 #[must_use]
 pub fn preview_text(meta: &Metadata, lang: Lang) -> String {
     use std::fmt::Write as _;
@@ -131,14 +123,13 @@ pub fn preview_text(meta: &Metadata, lang: Lang) -> String {
     format!("{}\n{line2}", escape_caption(&meta.title))
 }
 
-/// Escape text for Telegram HTML parse mode (we send captions as HTML).
+/// Captions go out as HTML, so `<`, `>`, `&` must be escaped.
 fn escape_caption(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
 
-/// Progress bar: `⬇️ Downloading ████████░░ 82%`.
 #[must_use]
 pub fn progress_bar(prefix: &str, pct: u8) -> String {
     let filled = usize::from(pct) * 10 / 100;

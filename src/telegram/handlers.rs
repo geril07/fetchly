@@ -22,7 +22,6 @@ use crate::prefs::UserPrefs;
 use crate::session::{SessionStore, StoredSession};
 use crate::telegram::keyboard::{self, format_bytes};
 
-/// Shared state injected into every handler via `dptree::deps!`.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
@@ -31,18 +30,13 @@ pub struct AppState {
     pub sessions: SessionStore,
     pub limiter: RateLimiter,
     pub semaphore: Arc<tokio::sync::Semaphore>,
-    /// In-flight downloads: `session_id` → cancel token (wired to ❌ button).
+    /// `session_id` → cancel token (wired to ❌ button).
     pub downloads: Arc<tokio::sync::Mutex<HashMap<String, CancellationToken>>>,
-    /// Chats with a queued or in-flight download: `session_id` → chat.
-    /// Registered before semaphore acquisition (covers the queued state),
-    /// removed on every pipeline exit. Read once at shutdown for notices.
+    /// Registered before semaphore acquisition so parked waiters get shutdown notices; removed on every pipeline exit.
     pub notify: Arc<tokio::sync::Mutex<HashMap<String, ChatId>>>,
-    /// In-flight downloads per user (queued + running count toward the cap).
     pub user_slots: Arc<tokio::sync::Mutex<HashMap<u64, usize>>>,
-    /// Tasks currently inside semaphore admission (parked waiters + handoff).
-    /// Global backpressure bound; decremented right after a permit is granted.
+    /// Parked waiters + handoff; decremented right after a permit is granted.
     pub queued: Arc<AtomicUsize>,
-    /// Singleflight registry: identical concurrent taps share one download.
     pub flights: Flights,
     pub http: reqwest::Client,
 }
@@ -75,14 +69,11 @@ impl AppState {
     }
 }
 
-/// Singleflight key: same URL + format + quality tapped twice concurrently
-/// downloads once; latecomers attach and get the finished file.
+/// Same URL + format + quality tapped twice concurrently downloads once; latecomers attach.
 pub type FlightKey = (String, String, String);
 
-/// One in-flight download shared by identical concurrent taps:
-/// the first tapper (leader) runs the pipeline, the rest (waiters) get the
-/// finished `file_id` fanned out to their chats. Pure in-memory, no Redis.
-/// Waiters carry their own language so fan-out notices match their locale.
+/// First tapper (leader) runs the pipeline; waiters get the finished `file_id`. Pure in-memory, no Redis.
+/// Waiters carry their own language so fan-out matches their locale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FlightWaiter {
     pub chat: ChatId,
@@ -93,9 +84,7 @@ pub struct FlightWaiter {
 pub struct Flights(Arc<tokio::sync::Mutex<HashMap<FlightKey, Vec<FlightWaiter>>>>);
 
 impl Flights {
-    /// Register interest in a download. Returns `true` for the leader (runs
-    /// the pipeline), `false` for a waiter (waits for fan-out). Atomic under
-    /// the map lock, so simultaneous taps elect exactly one leader.
+    /// `true` = leader (runs the pipeline), `false` = waiter. Simultaneous taps elect exactly one leader.
     pub async fn attach_or_lead(&self, key: &FlightKey, chat: ChatId, lang: Lang) -> bool {
         let mut flights = self.0.lock().await;
         if let Some(waiters) = flights.get_mut(key) {
@@ -107,9 +96,7 @@ impl Flights {
         }
     }
 
-    /// Leader done: drop the entry and hand over waiter chats for fan-out.
-    /// A tap arriving after this becomes a new leader (and normally hits the
-    /// `file_id` cache instantly, since the leader caches before finishing).
+    /// A tap arriving after this normally hits the `file_id` cache instantly.
     pub async fn finish(&self, key: &FlightKey) -> Vec<FlightWaiter> {
         self.0.lock().await.remove(key).unwrap_or_default()
     }
@@ -131,8 +118,7 @@ pub enum Command {
     Language,
 }
 
-/// Max file size label from config: Local Bot API unlocks 2 GB, else 50 MB.
-/// Units stay untranslated (shared across locales).
+/// Local Bot API unlocks 2 GB, else 50 MB. Units stay untranslated.
 fn upload_limit_label(config: &Config) -> &'static str {
     if config.api_url.is_some() {
         "2 GB"
@@ -141,7 +127,6 @@ fn upload_limit_label(config: &Config) -> &'static str {
     }
 }
 
-/// Help text built from live config (rate, concurrency, upload cap).
 fn help_text(config: &Config, lang: Lang) -> String {
     i18n::help(
         lang,
@@ -151,9 +136,7 @@ fn help_text(config: &Config, lang: Lang) -> String {
     )
 }
 
-/// Resolve the chat language: explicit `/language` choice first,
-/// Telegram `language_code` guess on first run, English fallback.
-/// A prefs-backend failure never fails the request — it only logs.
+/// Explicit `/language` choice first; a prefs failure only logs and falls back to the Telegram guess.
 async fn resolve_lang(state: &AppState, user_id: u64, tg_code: Option<&str>) -> Lang {
     match state.prefs.get(user_id).await {
         Ok(Some(lang)) => lang,
@@ -165,7 +148,6 @@ async fn resolve_lang(state: &AppState, user_id: u64, tg_code: Option<&str>) -> 
     }
 }
 
-/// Human-readable duration: `45s`, `2m 5s`, `1h 3m`.
 fn format_duration(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
@@ -187,7 +169,6 @@ fn format_duration(secs: u64) -> String {
     }
 }
 
-/// User-facing usage snapshot: hourly quota + reset + slots + file cap.
 /// Read-only: never consumes rate-limit quota.
 async fn usage_text(state: &AppState, user_id: u64, lang: Lang) -> String {
     let slots = state
@@ -224,12 +205,8 @@ async fn usage_text(state: &AppState, user_id: u64, lang: Lang) -> String {
     }
 }
 
-/// Register menu commands + profile texts. Idempotent, best-effort:
-/// logs a warning on failure, never fails startup (e.g. no network).
-///
-/// Each item is set twice: the default (English) and the `ru` locale.
-/// Telegram shows the client-language variant in the app menu; chat messages
-/// always follow the `/language` choice, not the menu locale.
+/// Idempotent, best-effort: logs a warning, never fails startup (e.g. no network).
+/// Each item is set twice (default + `ru`); chat messages always follow `/language`, not the menu locale.
 pub async fn init_telegram(bot: &Bot) {
     if let Err(e) = bot
         .set_my_commands(Command::bot_commands())
@@ -260,8 +237,7 @@ pub async fn init_telegram(bot: &Bot) {
     }
 }
 
-/// Russian menu commands. Names stay Latin (Telegram requires
-/// `[a-z0-9_]`); only descriptions are translated.
+/// Names stay Latin (Telegram requires `[a-z0-9_]`); only descriptions are translated.
 fn ru_commands() -> Vec<teloxide::types::BotCommand> {
     use teloxide::types::BotCommand;
     vec![
@@ -294,8 +270,7 @@ async fn set_short_description(bot: &Bot, lang: Lang, code: Option<&str>) -> Res
     Ok(())
 }
 
-/// Reply with the sender's usage, or a fallback when Telegram omits the
-/// sender (e.g. channel posts). Never attributes quota to a shared id.
+/// Never attributes quota to a shared id when Telegram omits the sender (e.g. channel posts).
 async fn reply_usage(bot: &Bot, msg: &Message, state: &AppState, lang: Lang) -> Result<()> {
     let Some(user) = msg.from.as_ref() else {
         bot.send_message(msg.chat.id, i18n::usage_no_sender(lang))
@@ -307,13 +282,11 @@ async fn reply_usage(bot: &Bot, msg: &Message, state: &AppState, lang: Lang) -> 
     Ok(())
 }
 
-/// Entry point for text messages.
 pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<()> {
     let Some(text) = msg.text() else {
         return Ok(());
     };
     let text = text.to_owned();
-    // Language guess for first-run users; explicit `/language` choice wins.
     let tg_code = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
     let user_id = msg.from.as_ref().map_or(0, |u| u.id.0);
     let lang = resolve_lang(&state, user_id, tg_code).await;
@@ -336,7 +309,6 @@ pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<(
         }
         return Ok(());
     }
-    // Also handle bare `/start`/`/help`/`/usage`/`/language` with bot username suffix.
     if text.starts_with("/start") {
         bot.send_message(msg.chat.id, i18n::welcome(lang)).await?;
         return Ok(());
@@ -392,13 +364,11 @@ pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<(
 
     let caption = keyboard::preview_text(&meta, lang);
     let markup = keyboard::preview_keyboard(&session_id, lang);
-    // Delete the "resolving" placeholder, then send the preview card.
     let _ = bot.delete_message(msg.chat.id, status.id).await;
     send_preview(&bot, msg.chat.id, &meta, &caption, markup, &state.http).await?;
     Ok(())
 }
 
-/// `/language` picker: bilingual prompt with English/Русский buttons.
 async fn reply_language_picker(bot: &Bot, chat: ChatId) -> Result<()> {
     bot.send_message(chat, i18n::language_prompt())
         .reply_markup(keyboard::language_keyboard())
@@ -406,7 +376,6 @@ async fn reply_language_picker(bot: &Bot, chat: ChatId) -> Result<()> {
     Ok(())
 }
 
-/// Send preview card: photo + caption when a thumbnail exists, else plain text.
 async fn send_preview(
     bot: &Bot,
     chat: ChatId,
@@ -451,10 +420,7 @@ async fn fetch_bytes(
         .to_vec())
 }
 
-/// First URL-like token in free text.
-///
-/// Leading `<` / trailing `>` wrapping (some clients autolink that way) is
-/// stripped before the scheme check.
+/// Some clients wrap links in `<…>`; strip that before the scheme check.
 pub(crate) fn extract_url(text: &str) -> Option<String> {
     text.split_whitespace()
         .map(|t| t.trim().trim_matches(|c| c == '<' || c == '>'))
@@ -462,7 +428,6 @@ pub(crate) fn extract_url(text: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Entry point for all callback queries.
 pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Result<()> {
     let Some(data) = q.data.clone() else {
         return Ok(());
@@ -473,7 +438,7 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
     let user_id = q.from.id.0;
     let tg_code = q.from.language_code.as_deref();
 
-    // `/language` picker taps carry no session: `lang:en` / `lang:ru`.
+    // `lang:en` / `lang:ru` taps carry no session.
     if let Some(code) = data.strip_prefix("lang:") {
         handle_lang_tap(&bot, &state, &q, chat, msg_id, code, tg_code).await?;
         return Ok(());
@@ -488,7 +453,6 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
         return Ok(());
     };
 
-    // ❌ Cancel: wired to the in-flight download token.
     if data.starts_with("cancel:") {
         let token = state.downloads.lock().await.remove(&session_id);
         if let Some(t) = token {
@@ -543,8 +507,7 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
                 return Ok(());
             };
             bot.answer_callback_query(q.id).await?;
-            // Detached: the chat's update queue must stay live for ❌ taps
-            // while the multi-minute pipeline runs (see fix 3 notes).
+            // The update queue must stay live for ❌ taps while the pipeline runs.
             tokio::spawn(run_video(
                 bot, chat, msg_id, user_id, session_id, session, quality, state, lang,
             ));
@@ -568,9 +531,7 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
     Ok(())
 }
 
-/// Record an explicit `/language` choice and confirm in the chosen language.
-/// Unknown codes are ignored (stale buttons). A prefs-backend failure answers
-/// with a generic error instead of silently keeping the old language.
+/// Unknown codes are stale buttons and ignored; a prefs failure answers with a generic error.
 async fn handle_lang_tap(
     bot: &Bot,
     state: &AppState,
@@ -605,10 +566,7 @@ fn callback_origin(q: &CallbackQuery) -> Option<(ChatId, MessageId)> {
     }
 }
 
-/// Forward 0–100 download progress to a throttled Telegram progress message.
-///
-/// `scale_to` reserves headroom for later stages: video scales to 100,
-/// audio to 80 (the last 20% of the bar is convert + upload).
+/// `scale_to` reserves headroom: video 100, audio 80 (convert + upload take the last 20%).
 fn spawn_progress_forwarder(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<u8>,
     bot: Bot,
@@ -628,9 +586,7 @@ fn spawn_progress_forwarder(
     })
 }
 
-/// Attach `ID3` tags + cover art to a converted `MP3`.
-///
-/// Best-effort: tagging never fails the download, it only logs.
+/// Best-effort: tagging only logs on failure.
 async fn tag_downloaded_audio(
     session: &StoredSession,
     mp3_path: &std::path::Path,
@@ -661,8 +617,7 @@ async fn tag_downloaded_audio(
     }
 }
 
-/// Standard Bot API caps uploads at 50 MB; larger files need a Local Bot API
-/// Server (see `TELEGRAM_API_URL`). Checked before attempting a doomed upload.
+/// Checked before attempting a doomed upload.
 const STANDARD_UPLOAD_LIMIT: u64 = 50_000_000;
 
 async fn exceeds_standard_limit(path: &std::path::Path) -> bool {
@@ -671,9 +626,7 @@ async fn exceeds_standard_limit(path: &std::path::Path) -> bool {
         .is_ok_and(|m| m.len() > STANDARD_UPLOAD_LIMIT)
 }
 
-/// Map an upload failure to user text. A 413 from Telegram means the file
-/// passed our 2 GB guard but exceeds the 50 MB standard-API cap (e.g. the
-/// size estimate was off or the limit check was bypassed by cache racing).
+/// A 413 means the file passed the 2 GB guard but exceeds the 50 MB standard-API cap.
 fn upload_error_message(raw: &str, lang: Lang) -> String {
     if raw.to_lowercase().contains("too large") {
         i18n::over_limit(lang).to_owned()
@@ -682,9 +635,7 @@ fn upload_error_message(raw: &str, lang: Lang) -> String {
     }
 }
 
-/// Edit a preview card that may be a text message or a photo caption.
-/// Telegram rejects `editMessageText` on photos ("no text in the message"),
-/// so fall back to `editMessageCaption`.
+/// Telegram rejects `editMessageText` on photos, so fall back to `editMessageCaption`.
 async fn edit_preview_text(bot: &Bot, chat: ChatId, msg: MessageId, text: &str) {
     if bot.edit_message_text(chat, msg, text).await.is_ok() {
         return;
@@ -692,10 +643,7 @@ async fn edit_preview_text(bot: &Bot, chat: ChatId, msg: MessageId, text: &str) 
     let _ = bot.edit_message_caption(chat, msg).caption(text).await;
 }
 
-/// Acquire a download slot, telling the user they are queued when busy.
-/// Over the global waiter cap (`max_queued`), reject immediately with a busy
-/// notice instead of parking another task — this is the backpressure bound
-/// that keeps overload from growing memory and update-queue depth.
+/// Over the waiter cap, reject with a busy notice instead of parking another task.
 async fn acquire_permit(
     bot: &Bot,
     chat: ChatId,
@@ -719,11 +667,7 @@ async fn acquire_permit(
     permit
 }
 
-/// Run a pipeline stage against an absolute deadline (whole-pipeline budget:
-/// callers share one deadline across download + convert). On expiry the
-/// stage's token is cancelled — subprocesses die via `kill_on_drop` plus the
-/// explicit kill on cancel, so the awaited future resolves promptly — and the
-/// caller sees [`Error::TimedOut`] instead of [`Error::Cancelled`].
+/// On expiry the stage token is cancelled and the caller sees [`Error::TimedOut`].
 async fn with_deadline<F, T>(
     deadline: tokio::time::Instant,
     timeout_secs: u64,
@@ -752,15 +696,9 @@ where
     out
 }
 
-/// Best-effort restart notice to every queued/in-flight chat, then cancel all
-/// download tokens. Bounded by `NOTIFY_TIMEOUT_SECS`; send failures are
-/// logged, never fatal — shutdown must not hang on a dead network.
-///
-/// The notice is bilingual: shutdown has only chat ids, no user ids, so the
-/// per-user language is unresolvable here.
+/// Bounded by `NOTIFY_TIMEOUT_SECS`; shutdown has only chat ids, so the notice is bilingual.
 const NOTIFY_TIMEOUT_SECS: u64 = 15;
 
-/// Bilingual restart notice (see [`shutdown_notify`]).
 fn restart_bilingual() -> String {
     format!("{}\n{}", i18n::restart(Lang::En), i18n::restart(Lang::Ru))
 }
@@ -801,8 +739,7 @@ pub async fn shutdown_notify(bot: Bot, state: &AppState) {
     }
 }
 
-/// Take one of the user's in-flight slots (queued + running count toward
-/// `max_per_user`). Returns `false` when the user is at their cap.
+/// Returns `false` when the user is at their cap.
 async fn acquire_user_slot(state: &AppState, user_id: u64) -> bool {
     let mut slots = state.user_slots.lock().await;
     let used = slots.get(&user_id).copied().unwrap_or(0);
@@ -813,8 +750,7 @@ async fn acquire_user_slot(state: &AppState, user_id: u64) -> bool {
     true
 }
 
-/// Release a slot taken by [`acquire_user_slot`]. Called on every pipeline
-/// exit after acquisition — audit these sites when adding new returns.
+/// Called on every pipeline exit after acquisition — audit these sites when adding new returns.
 async fn release_user_slot(state: &AppState, user_id: u64) {
     let mut slots = state.user_slots.lock().await;
     if let Some(used) = slots.get_mut(&user_id) {
@@ -825,8 +761,7 @@ async fn release_user_slot(state: &AppState, user_id: u64) {
     }
 }
 
-/// Leader done: unregister the flight and send the finished file to every
-/// attached waiter chat. Best-effort per chat; failures are logged.
+/// Best-effort per chat; failures are logged.
 async fn fan_out_file(
     bot: &Bot,
     state: &AppState,
@@ -860,7 +795,6 @@ async fn fan_out_file(
     }
 }
 
-/// Leader failed or gave up: unregister the flight and notify waiter chats.
 /// Each waiter gets the notice in their own language.
 async fn fan_out_notice(
     bot: &Bot,
@@ -875,11 +809,7 @@ async fn fan_out_notice(
     }
 }
 
-/// Video download pipeline: cache → user slot → singleflight → rate limit → semaphore → yt-dlp → upload.
-///
-/// Quota is consumed only after cache, per-user cap, and dedup all pass, so
-/// rejected taps never burn hourly quota. Post-consume admission failures
-/// (global queue full, progress message failure) refund the unit.
+/// Quota is consumed only after cache, per-user cap, and dedup pass; post-consume admission failures refund.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_video(
     bot: Bot,
@@ -894,7 +824,6 @@ async fn run_video(
 ) {
     let quality_code = quality.as_str().to_owned();
 
-    // Instant path: same URL+format+quality seen before. No slot, no quota.
     if let Ok(Some(file_id)) = state
         .cache
         .get(&session.url_hash, "video", &quality_code)
@@ -908,14 +837,12 @@ async fn run_video(
                 quality.label(lang)
             ))
             .await;
-        // A stale file_id (message deleted upstream) falls through to re-download.
+        // A stale file_id falls through to re-download.
         if sent.is_ok() {
             return;
         }
     }
 
-    // One user must not hold every worker: queued + running count toward the cap.
-    // Before quota: a capped tap is rejected without burning hourly downloads.
     if !acquire_user_slot(&state, user_id).await {
         respond(
             bot,
@@ -929,9 +856,6 @@ async fn run_video(
         return;
     }
 
-    // Singleflight: an identical download already running serves this tap.
-    // Waiters hold no worker and no user slot; the leader fans the file out.
-    // Before quota: deduped waiters consume nothing.
     let flight_key = (
         session.url_hash.clone(),
         "video".to_owned(),
@@ -953,8 +877,6 @@ async fn run_video(
         return;
     }
 
-    // Queue when all workers are busy.
-    // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
     let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state, lang).await else {
         state.notify.lock().await.remove(&session_id);
@@ -967,7 +889,7 @@ async fn run_video(
         return;
     };
 
-    // Whole-pipeline budget (download + upload); queued time does not count.
+    // Queued time does not count; the clock starts at semaphore acquisition.
     let timeout_secs = state.config.download_timeout_secs;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
@@ -1089,8 +1011,6 @@ async fn run_video(
     }
 }
 
-/// Upload a finished video file, cache its `file_id`.
-/// Returns the `file_id` on success so the singleflight leader can fan it out.
 #[allow(clippy::too_many_arguments)]
 async fn upload_video(
     bot: &Bot,
@@ -1139,10 +1059,7 @@ async fn upload_video(
     }
 }
 
-/// Audio pipeline: cache → user slot → singleflight → rate limit → semaphore → yt-dlp → ffmpeg → tag → upload.
-///
-/// Same admission order as [`run_video`]: rejected, deduped, or cached taps
-/// never consume hourly quota; post-consume admission failures refund.
+/// Same admission order as [`run_video`].
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_audio(
     bot: Bot,
@@ -1171,8 +1088,6 @@ async fn run_audio(
         }
     }
 
-    // One user must not hold every worker: queued + running count toward the cap.
-    // Before quota: a capped tap is rejected without burning hourly downloads.
     if !acquire_user_slot(&state, user_id).await {
         respond(
             bot,
@@ -1186,9 +1101,6 @@ async fn run_audio(
         return;
     }
 
-    // Singleflight: an identical download already running serves this tap.
-    // Waiters hold no worker and no user slot; the leader fans the file out.
-    // Before quota: deduped waiters consume nothing.
     let flight_key = (
         session.url_hash.clone(),
         "audio".to_owned(),
@@ -1210,7 +1122,6 @@ async fn run_audio(
         return;
     }
 
-    // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
     let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state, lang).await else {
         state.notify.lock().await.remove(&session_id);
@@ -1223,7 +1134,7 @@ async fn run_audio(
         return;
     };
 
-    // Whole-pipeline budget (download + convert + upload); queued time does not count.
+    // Queued time does not count; the clock starts at semaphore acquisition.
     let timeout_secs = state.config.download_timeout_secs;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
@@ -1366,8 +1277,6 @@ async fn run_audio(
     }
 }
 
-/// Upload a finished `MP3`, cache its `file_id`, and retire the progress message.
-/// Returns the `file_id` on success so the singleflight leader can fan it out.
 #[allow(clippy::too_many_arguments)]
 async fn upload_audio(
     bot: &Bot,
@@ -1445,7 +1354,6 @@ async fn cleanup(dir: &std::path::Path) {
     }
 }
 
-/// Build the dispatcher schema: commands + URL messages + callbacks.
 #[must_use]
 pub fn schema() -> teloxide::dispatching::UpdateHandler<Error> {
     use teloxide::dispatching::UpdateFilterExt;
@@ -1530,7 +1438,6 @@ mod tests {
     #[tokio::test]
     async fn expired_deadline_cancels_and_reports_timeout() {
         let cancel = CancellationToken::new();
-        // Mimics the pipeline stages: resolve promptly once cancelled.
         let fut = async {
             cancel.cancelled().await;
             Err::<(), Error>(Error::Cancelled)
@@ -1605,7 +1512,6 @@ mod tests {
             Arc::new(tokio::sync::Semaphore::new(2)),
             reqwest::Client::new(),
         );
-        // Free permits: no Telegram calls, pure admission accounting.
         let bot = Bot::new("test-token");
         let permit = acquire_permit(&bot, ChatId(1), MessageId(1), &state, Lang::En).await;
         assert!(permit.is_some());
@@ -1634,8 +1540,6 @@ mod tests {
 
     #[test]
     fn menu_commands_match_i18n() {
-        // The derive-macro descriptions are the English menu: they must not
-        // drift from `i18n` (the `ru` menu is built from `i18n` directly).
         let cmds = Command::bot_commands();
         let want = [
             i18n::cmd_start_desc(Lang::En),
@@ -1650,7 +1554,6 @@ mod tests {
 
     #[test]
     fn ru_menu_names_are_valid_commands() {
-        // Telegram command names: 1–32 chars of a-z, 0-9, underscore.
         for cmd in ru_commands() {
             assert!((1..=32).contains(&cmd.command.len()), "{}", cmd.command);
             assert!(
@@ -1674,7 +1577,6 @@ mod tests {
         let key = flight_key("hash", "video", "720");
         assert!(flights.attach_or_lead(&key, ChatId(1), Lang::En).await);
         assert!(!flights.attach_or_lead(&key, ChatId(2), Lang::Ru).await);
-        // Different qualities still download independently.
         let other = flight_key("hash", "video", "1080");
         assert!(flights.attach_or_lead(&other, ChatId(3), Lang::En).await);
     }
@@ -1699,7 +1601,6 @@ mod tests {
                 },
             ]
         );
-        // Key released: the next tapper leads again.
         assert!(flights.attach_or_lead(&key, ChatId(4), Lang::En).await);
     }
 
@@ -1816,11 +1717,9 @@ mod tests {
             Arc::new(tokio::sync::Semaphore::new(2)),
             reqwest::Client::new(),
         );
-        // No row: Telegram guess wins.
         assert_eq!(resolve_lang(&state, 4242, Some("ru-RU")).await, Lang::Ru);
         assert_eq!(resolve_lang(&state, 4242, Some("en-US")).await, Lang::En);
         assert_eq!(resolve_lang(&state, 4242, None).await, Lang::En);
-        // Explicit choice beats the guess both ways.
         state.prefs.set(4242, Lang::En).await.expect("set");
         assert_eq!(resolve_lang(&state, 4242, Some("ru-RU")).await, Lang::En);
         state.prefs.set(4242, Lang::Ru).await.expect("set");

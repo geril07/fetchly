@@ -36,10 +36,8 @@ async fn main() -> anyhow::Result<()> {
     );
     tokio::fs::create_dir_all(&config.temp_dir).await?;
 
-    // Remove stale temp dirs from previous runs (>10 min old safety net).
     spawn_temp_cleanup(config.temp_dir.clone());
 
-    // Redis: sessions + rate limiting (ConnectionManager auto-reconnects).
     let redis_client = redis::Client::open(config.redis_url.as_str())?;
     let manager = redis_client.get_connection_manager().await?;
     let sessions = SessionStore::new(manager.clone());
@@ -66,7 +64,6 @@ async fn main() -> anyhow::Result<()> {
     let state = telegram::AppState::new(config, cache, prefs, sessions, limiter, semaphore, http);
     let notify_bot = bot.clone();
 
-    // Register menu commands + profile texts (idempotent, best-effort).
     telegram::init_telegram(&bot).await;
 
     let mut dispatcher = Dispatcher::builder(bot, telegram::schema())
@@ -74,9 +71,7 @@ async fn main() -> anyhow::Result<()> {
         .enable_ctrlc_handler()
         .build();
 
-    // Graceful shutdown: SIGINT/SIGTERM stops polling after waiters get a
-    // restart notice and download tokens are cancelled (120s grace in
-    // compose). Telegram queues updates during the gap — nothing is lost.
+    // Telegram queues updates during the shutdown gap, so nothing is lost.
     tokio::select! {
         () = dispatcher.dispatch() => {},
         () = shutdown_signal() => {
@@ -87,8 +82,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// SIGINT (Ctrl-C) plus SIGTERM (`docker stop` sends TERM; without this the
-/// process would die instantly with no notices sent).
+/// `docker stop` sends SIGTERM; without this the process would die with no notices sent.
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -120,7 +114,6 @@ fn init_logging() {
         .init();
 }
 
-/// Background task: delete anything in the temp dir older than 10 minutes.
 fn spawn_temp_cleanup(temp_dir: std::path::PathBuf) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));

@@ -17,7 +17,6 @@ pub enum Lang {
 }
 
 impl Lang {
-    /// Stored code (`user_lang` table, `lang:en` callbacks).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -47,7 +46,6 @@ impl Lang {
     }
 }
 
-/// Welcome text for `/start`.
 #[must_use]
 pub fn welcome(lang: Lang) -> &'static str {
     match lang {
@@ -60,7 +58,6 @@ pub fn welcome(lang: Lang) -> &'static str {
     }
 }
 
-/// Usage guide for `/help`. Limits come from live config.
 #[must_use]
 pub fn help(lang: Lang, rate_limit: u32, max_per_user: usize, upload: &str) -> String {
     match lang {
@@ -73,7 +70,6 @@ pub fn help(lang: Lang, rate_limit: u32, max_per_user: usize, upload: &str) -> S
     }
 }
 
-/// Title of the `/usage` snapshot.
 #[must_use]
 pub fn usage_title(lang: Lang) -> &'static str {
     match lang {
@@ -82,7 +78,6 @@ pub fn usage_title(lang: Lang) -> &'static str {
     }
 }
 
-/// Body of the `/usage` snapshot. `reset` is a preformatted duration or full-quota note.
 pub struct UsageView<'a> {
     pub used: u32,
     pub limit: u32,
@@ -93,7 +88,6 @@ pub struct UsageView<'a> {
     pub upload: &'a str,
 }
 
-/// Body of the `/usage` snapshot.
 #[must_use]
 pub fn usage_body(lang: Lang, v: &UsageView<'_>) -> String {
     match lang {
@@ -122,7 +116,6 @@ pub fn usage_body(lang: Lang, v: &UsageView<'_>) -> String {
     }
 }
 
-/// `Reset:` value when the window is untouched.
 #[must_use]
 pub fn reset_full(lang: Lang) -> &'static str {
     match lang {
@@ -131,7 +124,6 @@ pub fn reset_full(lang: Lang) -> &'static str {
     }
 }
 
-/// Fallback when the rate-limit backend is unreachable.
 #[must_use]
 pub fn usage_unavailable(lang: Lang) -> &'static str {
     match lang {
@@ -140,7 +132,6 @@ pub fn usage_unavailable(lang: Lang) -> &'static str {
     }
 }
 
-/// Reply when Telegram omits the sender (e.g. channel posts).
 #[must_use]
 pub fn usage_no_sender(lang: Lang) -> &'static str {
     match lang {
@@ -149,7 +140,6 @@ pub fn usage_no_sender(lang: Lang) -> &'static str {
     }
 }
 
-/// Hint for plain-text messages without a URL.
 #[must_use]
 pub fn send_link_hint(lang: Lang) -> &'static str {
     match lang {
@@ -158,7 +148,6 @@ pub fn send_link_hint(lang: Lang) -> &'static str {
     }
 }
 
-/// Placeholder while metadata resolves.
 #[must_use]
 pub fn resolving(lang: Lang) -> &'static str {
     match lang {
@@ -167,7 +156,6 @@ pub fn resolving(lang: Lang) -> &'static str {
     }
 }
 
-/// Callback answer for buttons from an expired session.
 #[must_use]
 pub fn outdated_button(lang: Lang) -> &'static str {
     match lang {
@@ -176,7 +164,6 @@ pub fn outdated_button(lang: Lang) -> &'static str {
     }
 }
 
-/// Callback answer while a cancel is being processed.
 #[must_use]
 pub fn cancelling(lang: Lang) -> &'static str {
     match lang {
@@ -185,7 +172,6 @@ pub fn cancelling(lang: Lang) -> &'static str {
     }
 }
 
-/// Callback answer when there is no download to cancel.
 #[must_use]
 pub fn nothing_to_cancel(lang: Lang) -> &'static str {
     match lang {
@@ -194,7 +180,6 @@ pub fn nothing_to_cancel(lang: Lang) -> &'static str {
     }
 }
 
-/// Edit text after a cancel.
 #[must_use]
 pub fn cancelled(lang: Lang) -> &'static str {
     match lang {
@@ -203,7 +188,6 @@ pub fn cancelled(lang: Lang) -> &'static str {
     }
 }
 
-/// Session-gone text (callback answer and preview edit share it).
 #[must_use]
 pub fn session_expired(lang: Lang) -> &'static str {
     match lang {
@@ -212,7 +196,6 @@ pub fn session_expired(lang: Lang) -> &'static str {
     }
 }
 
-/// Callback answer for an unknown quality code.
 #[must_use]
 pub fn unknown_quality(lang: Lang) -> &'static str {
     match lang {
@@ -221,7 +204,6 @@ pub fn unknown_quality(lang: Lang) -> &'static str {
     }
 }
 
-/// Notice while parked behind the global semaphore.
 #[must_use]
 pub fn queued(lang: Lang) -> &'static str {
     match lang {
@@ -230,7 +212,6 @@ pub fn queued(lang: Lang) -> &'static str {
     }
 }
 
-/// Rejection when the waiter cap is hit.
 #[must_use]
 pub fn busy(lang: Lang) -> &'static str {
     match lang {
@@ -239,7 +220,6 @@ pub fn busy(lang: Lang) -> &'static str {
     }
 }
 
-/// Restart notice on shutdown.
 #[must_use]
 pub fn restart(lang: Lang) -> &'static str {
     match lang {
@@ -252,7 +232,6 @@ pub fn restart(lang: Lang) -> &'static str {
     }
 }
 
-/// Note for a tapper joining an already-running identical download.
 #[must_use]
 pub fn flight_wait(lang: Lang) -> &'static str {
     match lang {
@@ -261,7 +240,6 @@ pub fn flight_wait(lang: Lang) -> &'static str {
     }
 }
 
-/// Leader gave up before producing a file.
 #[must_use]
 pub fn flight_retry(lang: Lang) -> &'static str {
     match lang {
@@ -270,7 +248,6 @@ pub fn flight_retry(lang: Lang) -> &'static str {
     }
 }
 
-/// Leader was cancelled by someone else.
 #[must_use]
 pub fn flight_cancelled(lang: Lang) -> &'static str {
     match lang {
@@ -279,7 +256,6 @@ pub fn flight_cancelled(lang: Lang) -> &'static str {
     }
 }
 
-/// Fallback when the upload failed without a mappable message.
 #[must_use]
 pub fn flight_failed(lang: Lang) -> &'static str {
     match lang {
@@ -288,7 +264,6 @@ pub fn flight_failed(lang: Lang) -> &'static str {
     }
 }
 
-/// Initial progress text under the preview card.
 #[must_use]
 pub fn downloading_zero(lang: Lang) -> &'static str {
     match lang {
@@ -297,7 +272,6 @@ pub fn downloading_zero(lang: Lang) -> &'static str {
     }
 }
 
-/// Progress-bar prefix for the download stage.
 #[must_use]
 pub fn downloading_prefix(lang: Lang) -> &'static str {
     match lang {
@@ -306,7 +280,6 @@ pub fn downloading_prefix(lang: Lang) -> &'static str {
     }
 }
 
-/// Progress text for the convert stage.
 #[must_use]
 pub fn converting(lang: Lang) -> &'static str {
     match lang {
@@ -315,7 +288,6 @@ pub fn converting(lang: Lang) -> &'static str {
     }
 }
 
-/// Progress text for the upload stage (video pipeline).
 #[must_use]
 pub fn uploading(lang: Lang) -> &'static str {
     match lang {
@@ -324,7 +296,6 @@ pub fn uploading(lang: Lang) -> &'static str {
     }
 }
 
-/// Progress text for the upload stage (audio pipeline).
 #[must_use]
 pub fn uploading_audio(lang: Lang) -> &'static str {
     match lang {
@@ -346,7 +317,6 @@ pub fn over_limit(lang: Lang) -> &'static str {
     }
 }
 
-/// `Error::RateLimited` chat text.
 #[must_use]
 pub fn rate_limited(lang: Lang, retry_in_secs: u64) -> String {
     match lang {
@@ -355,7 +325,6 @@ pub fn rate_limited(lang: Lang, retry_in_secs: u64) -> String {
     }
 }
 
-/// Preview-card buttons and cancel labels.
 #[must_use]
 pub fn video_button(lang: Lang) -> &'static str {
     match lang {
@@ -364,7 +333,6 @@ pub fn video_button(lang: Lang) -> &'static str {
     }
 }
 
-/// Preview-card buttons and cancel labels.
 #[must_use]
 pub fn audio_button(lang: Lang) -> &'static str {
     match lang {
@@ -373,7 +341,6 @@ pub fn audio_button(lang: Lang) -> &'static str {
     }
 }
 
-/// Preview-card buttons and cancel labels.
 #[must_use]
 pub fn cancel_button(lang: Lang) -> &'static str {
     match lang {
@@ -382,7 +349,6 @@ pub fn cancel_button(lang: Lang) -> &'static str {
     }
 }
 
-/// "Best" quality label on quality pickers.
 #[must_use]
 pub fn best_label(lang: Lang) -> &'static str {
     match lang {
@@ -391,7 +357,6 @@ pub fn best_label(lang: Lang) -> &'static str {
     }
 }
 
-/// Duration placeholder for live/unknown streams.
 #[must_use]
 pub fn live_unknown(lang: Lang) -> &'static str {
     match lang {
@@ -445,7 +410,6 @@ pub fn views(lang: Lang, n: u64) -> String {
     }
 }
 
-/// User-facing error lines. Raw tool/DB details never leak into chat.
 #[must_use]
 pub fn error_unsupported(lang: Lang) -> &'static str {
     match lang {
@@ -454,7 +418,6 @@ pub fn error_unsupported(lang: Lang) -> &'static str {
     }
 }
 
-/// User-facing error lines. Raw tool/DB details never leak into chat.
 #[must_use]
 pub fn error_private(lang: Lang) -> &'static str {
     match lang {
@@ -463,7 +426,6 @@ pub fn error_private(lang: Lang) -> &'static str {
     }
 }
 
-/// User-facing error lines. Raw tool/DB details never leak into chat.
 #[must_use]
 pub fn error_too_large(lang: Lang) -> &'static str {
     match lang {
@@ -472,7 +434,6 @@ pub fn error_too_large(lang: Lang) -> &'static str {
     }
 }
 
-/// User-facing error lines. Raw tool/DB details never leak into chat.
 #[must_use]
 pub fn error_download(lang: Lang) -> &'static str {
     match lang {
@@ -481,7 +442,6 @@ pub fn error_download(lang: Lang) -> &'static str {
     }
 }
 
-/// User-facing error lines. Raw tool/DB details never leak into chat.
 #[must_use]
 pub fn error_resolve(lang: Lang) -> &'static str {
     match lang {
@@ -490,7 +450,6 @@ pub fn error_resolve(lang: Lang) -> &'static str {
     }
 }
 
-/// User-facing error lines. Raw tool/DB details never leak into chat.
 #[must_use]
 pub fn error_timed_out(lang: Lang, minutes: u64) -> String {
     match lang {
@@ -507,7 +466,6 @@ pub fn error_timed_out(lang: Lang, minutes: u64) -> String {
     }
 }
 
-/// User-facing error lines. Raw tool/DB details never leak into chat.
 #[must_use]
 pub fn error_too_many_concurrent(lang: Lang, max: usize) -> String {
     match lang {
@@ -520,7 +478,6 @@ pub fn error_too_many_concurrent(lang: Lang, max: usize) -> String {
     }
 }
 
-/// User-facing error lines. Raw tool/DB details never leak into chat.
 #[must_use]
 pub fn error_generic(lang: Lang) -> &'static str {
     match lang {

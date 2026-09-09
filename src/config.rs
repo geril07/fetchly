@@ -4,46 +4,34 @@ use std::path::PathBuf;
 
 /// Default per-download wall-clock budget (15 minutes).
 const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 900;
-/// Default cap on concurrent downloads per user (queued + running).
 const DEFAULT_MAX_PER_USER: usize = 2;
-/// Default ceiling on parked waiter tasks (global backpressure bound).
 const DEFAULT_MAX_QUEUED: usize = 20;
 
 /// Runtime configuration, all from environment (see `.env.example`).
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Telegram Bot API token (`TELEGRAM_BOT_TOKEN`, required).
     pub bot_token: String,
     /// Optional custom Bot API base URL (Local Bot API Server for >50 MB files).
     pub api_url: Option<String>,
-    /// Max concurrent downloads (global semaphore).
     pub max_workers: usize,
-    /// Max wall-clock seconds for one download pipeline (yt-dlp + convert).
     /// Queued time does not count; the clock starts at semaphore acquisition.
     pub download_timeout_secs: u64,
-    /// Downloads allowed per user per hour.
     pub rate_limit: u32,
-    /// Max in-flight downloads per user (queued + running count).
     pub max_per_user: usize,
-    /// Max tasks parked on the download semaphore (global backpressure).
     pub max_queued: usize,
-    /// `SQLite` file for the `file_id` cache.
     pub db_path: PathBuf,
-    /// Directory for temp downloads (`/tmp/fetchly/{session_id}/`).
     pub temp_dir: PathBuf,
-    /// Redis URL for sessions + rate limiting.
     pub redis_url: String,
 }
 
 impl Config {
-    /// Load from environment. Missing `.env` file is fine (env may come from Docker).
+    /// Missing `.env` file is fine (env may come from Docker).
     pub fn from_env() -> Result<Self, crate::error::Error> {
         let _ = dotenvy::dotenv();
         Self::from_map(&env::vars().collect())
     }
 
-    /// Pure constructor over an explicit map (keeps tests hermetic —
-    /// no global `env` mutation, so tests can run in parallel).
+    /// Keeps tests hermetic: no global `env` mutation, so tests run in parallel.
     fn from_map(vars: &HashMap<String, String>) -> Result<Self, crate::error::Error> {
         let bot_token = vars.get("TELEGRAM_BOT_TOKEN").cloned().unwrap_or_default();
         if bot_token.trim().is_empty() {

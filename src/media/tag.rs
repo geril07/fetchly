@@ -2,7 +2,6 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
-/// Info written into the `MP3` (`ID3v2`) and shown by Telegram as track metadata.
 #[derive(Debug, Clone, Default)]
 pub struct TagInfo {
     pub title: String,
@@ -13,8 +12,7 @@ pub struct TagInfo {
     pub cover_mime: Option<String>,
 }
 
-/// Fetch thumbnail bytes for cover art. Returns `None` on any failure
-/// (cover art is best-effort; the MP3 is still valid without it).
+/// Cover art is best-effort; the MP3 stays valid without it.
 pub async fn fetch_cover(url: &str) -> Option<(Vec<u8>, Option<String>)> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -36,8 +34,6 @@ pub async fn fetch_cover(url: &str) -> Option<(Vec<u8>, Option<String>)> {
     Some((bytes, mime))
 }
 
-/// Write `ID3v2` tags + embedded cover art into an `MP3` file.
-///
 /// Runs on a blocking thread (`lofty` is synchronous).
 pub async fn tag_mp3(path: &Path, info: TagInfo) -> Result<()> {
     let path = path.to_owned();
@@ -46,7 +42,6 @@ pub async fn tag_mp3(path: &Path, info: TagInfo) -> Result<()> {
         .map_err(|e| Error::Convert(format!("tagging task failed: {e}")))?
 }
 
-/// Synchronous lofty implementation.
 fn tag_mp3_blocking(path: &Path, info: &TagInfo) -> Result<()> {
     use lofty::config::WriteOptions;
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -58,14 +53,12 @@ fn tag_mp3_blocking(path: &Path, info: &TagInfo) -> Result<()> {
         .and_then(Probe::read)
         .map_err(|e| Error::Convert(format!("lofty read failed: {e}")))?;
 
-    // Ensure an ID3v2 tag exists.
     if tagged.primary_tag().is_none() {
         tagged.insert_tag(Tag::new(TagType::Id3v2));
     }
     let tag = tagged
         .primary_tag_mut()
         .ok_or_else(|| Error::Convert("lofty: no primary tag".to_owned()))?;
-    // Normalize to ID3v2 so Telegram/music players see it.
     if tag.tag_type() != TagType::Id3v2 {
         *tag = Tag::new(TagType::Id3v2);
     }
@@ -77,10 +70,8 @@ fn tag_mp3_blocking(path: &Path, info: &TagInfo) -> Result<()> {
     if let Some(album) = &info.album {
         tag.set_album(album.clone());
     }
-    // `year` is kept in `TagInfo` for future use; lofty 0.25 exposes dates
-    // via `Accessor::set_date(Timestamp)`, which needs a full date — the
-    // bare year from yt-dlp metadata is not enough to build one reliably,
-    // so we intentionally leave the date tag untouched.
+    // lofty 0.25 needs a full date for `set_date`; the bare yt-dlp year is not enough,
+    // so the date tag is left untouched.
     let _ = info.year;
 
     if let Some(bytes) = &info.cover_bytes {
@@ -113,8 +104,7 @@ mod tests {
         assert!(info.cover_bytes.is_none());
     }
 
-    /// Roundtrip through lofty: tag a copy of the committed fixture,
-    /// re-read it, assert fields + embedded cover. Never mutates the fixture.
+    /// Tags a copy of the fixture and re-reads it; never mutates the fixture.
     #[tokio::test]
     async fn tag_roundtrip_on_fixture() {
         let dir = tempfile::tempdir().expect("tempdir");

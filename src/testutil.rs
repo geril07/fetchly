@@ -1,24 +1,16 @@
-//! Test-only helpers: throwaway Redis for integration tests.
-//!
-//! Compiled only under `#[cfg(test)]`. Each test gets its own
-//! `redis:8-alpine` container, so tests are isolated by construction.
+//! Throwaway Redis for integration tests (`redis:8-alpine`, one container per test).
 
 use redis::aio::ConnectionManager;
 use testcontainers::{ContainerAsync, GenericImage};
 
-/// A live Redis plus the container that must stay alive while it is used.
+/// Dropping `_container` kills Redis, so tests must bind the guard.
 pub(crate) struct TestRedis {
-    /// Held (never read) to keep the container running for the test.
     pub _container: ContainerAsync<GenericImage>,
     pub manager: ConnectionManager,
     pub client: redis::Client,
 }
 
-/// Start a throwaway Redis 8 container.
-///
-/// Returns `None` (the caller skips the test) when Docker is unavailable —
-/// except under `CI`, where it panics so a broken Docker setup cannot
-/// silently green the suite.
+/// Returns `None` (caller skips) when Docker is unavailable; panics under `CI` so broken Docker cannot green the suite.
 pub(crate) async fn start_redis() -> Option<TestRedis> {
     use testcontainers::core::{IntoContainerPort as _, WaitFor};
     use testcontainers::runners::AsyncRunner as _;

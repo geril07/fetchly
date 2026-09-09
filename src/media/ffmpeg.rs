@@ -5,9 +5,6 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{Error, Result};
 use crate::media::ytdlp::AudioQuality;
 
-/// Convert any audio source to MP3 at the requested bitrate.
-///
-/// Runs `ffmpeg -i <src> -vn -c:a libmp3lame -b:a <bitrate> <dst>`.
 pub async fn to_mp3(
     src: &Path,
     dst: &Path,
@@ -51,7 +48,6 @@ pub async fn to_mp3(
     Ok(())
 }
 
-/// Build ffmpeg args (pure, for tests/docs).
 #[cfg(test)]
 #[must_use]
 pub fn mp3_args(src: &Path, dst: &Path, quality: AudioQuality) -> Vec<String> {

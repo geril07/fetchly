@@ -1,4 +1,3 @@
-/// Unified error type for the whole bot.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("configuration error: {0}")]
@@ -54,13 +53,11 @@ pub enum Error {
 }
 
 impl Error {
-    /// User-facing message (safe to send to chat) in the user's language.
     #[must_use]
     pub fn user_message(&self, lang: crate::i18n::Lang) -> String {
         use crate::i18n as t;
         match self {
-            // Explicit sentence-case copy (matches docs/v1-spec.md).
-            // The `Display` strings stay lowercase for log lines.
+            // Sentence-case copy matches docs/v1-spec.md; `Display` stays lowercase for logs.
             Self::UnsupportedUrl => t::error_unsupported(lang).to_owned(),
             Self::PrivateOrRestricted => t::error_private(lang).to_owned(),
             Self::TooLarge => t::error_too_large(lang).to_owned(),
@@ -87,7 +84,6 @@ impl From<teloxide::RequestError> for Error {
 
 impl From<redis::RedisError> for Error {
     fn from(e: redis::RedisError) -> Self {
-        // Callers map to Session/Limiter/Cache as appropriate; default to session.
         Self::Session(e.to_string())
     }
 }
@@ -98,7 +94,6 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
-/// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
@@ -108,7 +103,6 @@ mod tests {
 
     #[test]
     fn user_messages_are_safe_to_send() {
-        // Raw tool/DB details must never leak into chat.
         let cases: Vec<(Error, &str, &str)> = vec![
             (
                 Error::UnsupportedUrl,
