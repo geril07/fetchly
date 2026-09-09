@@ -46,6 +46,9 @@ pub enum Error {
     #[error("download timed out after {minutes} minutes")]
     TimedOut { minutes: u64 },
 
+    #[error("too many concurrent downloads (max {max})")]
+    TooManyConcurrent { max: usize },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -67,6 +70,11 @@ impl Error {
             Self::TimedOut { minutes } => {
                 format!(
                     "Download timed out after {minutes} minutes. Try again or pick a lower quality."
+                )
+            }
+            Self::TooManyConcurrent { max } => {
+                format!(
+                    "You already have {max} downloads running. Wait for one to finish, then try again."
                 )
             }
             Self::RateLimited {
@@ -132,6 +140,10 @@ mod tests {
             (
                 Error::TimedOut { minutes: 15 },
                 "Download timed out after 15 minutes. Try again or pick a lower quality.",
+            ),
+            (
+                Error::TooManyConcurrent { max: 2 },
+                "You already have 2 downloads running. Wait for one to finish, then try again.",
             ),
             (
                 Error::RateLimited {
