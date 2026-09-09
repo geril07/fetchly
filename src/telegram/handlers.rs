@@ -74,32 +74,169 @@ impl AppState {
 /// downloads once; latecomers attach and get the finished file.
 pub type FlightKey = (String, String, String);
 
-/// One in-flight download shared by identical concurrent taps:
-/// the first tapper (leader) runs the pipeline, the rest (waiters) get the
-/// finished `file_id` fanned out to their chats. Pure in-memory, no Redis.
+/// A chat attached to someone else's download: gets live progress and the
+/// finished file. Carries its own session (for ❌ detach) and progress
+/// message (seeded at the current value on attach).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlightWaiter {
+    pub session: String,
+    pub chat: ChatId,
+    pub msg: MessageId,
+}
+
+/// One in-flight download shared by identical concurrent taps. The leader
+/// (first tapper) runs the pipeline under the shared cancel token; waiters
+/// mirror its progress and get the outcome fanned out. Pure in-memory.
+pub struct FlightEntry {
+    progress: u8,
+    leader_session: String,
+    leader_chat: ChatId,
+    leader_msg: Option<MessageId>,
+    waiters: Vec<FlightWaiter>,
+}
+
+/// Outcome of tapping a running flight: run it, mirror it, or stand down.
+pub enum Attach {
+    /// First tapper: run the pipeline (creates its own cancel token).
+    Leader,
+    /// Latecomer: mirror at the current percent (seed for the progress bar).
+    Waiter { pct: u8 },
+    /// Same chat already on this flight (leader or waiter): no second bar.
+    Duplicate,
+}
+
+/// Leadership handoff when the leader cancels but waiters remain.
+pub struct Promoted {
+    pub old_chat: ChatId,
+    pub old_msg: Option<MessageId>,
+    pub new_session: String,
+    pub new_chat: ChatId,
+}
+
+/// Singleflight registry: `FlightKey` → shared in-flight download.
 #[derive(Clone, Default)]
-pub struct Flights(Arc<tokio::sync::Mutex<HashMap<FlightKey, Vec<ChatId>>>>);
+pub struct Flights(Arc<tokio::sync::Mutex<HashMap<FlightKey, FlightEntry>>>);
 
 impl Flights {
-    /// Register interest in a download. Returns `true` for the leader (runs
-    /// the pipeline), `false` for a waiter (waits for fan-out). Atomic under
-    /// the map lock, so simultaneous taps elect exactly one leader.
-    pub async fn attach_or_lead(&self, key: &FlightKey, chat: ChatId) -> bool {
+    /// Tap a flight: elect the leader, mirror as a waiter, or stand down as
+    /// a duplicate. Atomic under the map lock: simultaneous taps elect
+    /// exactly one leader. Waiter registration itself happens in
+    /// [`Flights::add_waiter`] after its progress message is sent.
+    pub async fn attach(&self, key: &FlightKey, session: &str, chat: ChatId) -> Attach {
         let mut flights = self.0.lock().await;
-        if let Some(waiters) = flights.get_mut(key) {
-            waiters.push(chat);
-            false
-        } else {
-            flights.insert(key.clone(), Vec::new());
-            true
+        match flights.get(key) {
+            None => {
+                flights.insert(
+                    key.clone(),
+                    FlightEntry {
+                        progress: 0,
+                        leader_session: session.to_owned(),
+                        leader_chat: chat,
+                        leader_msg: None,
+                        waiters: Vec::new(),
+                    },
+                );
+                Attach::Leader
+            }
+            Some(entry) => {
+                if entry.leader_chat == chat || entry.waiters.iter().any(|w| w.chat == chat) {
+                    Attach::Duplicate
+                } else {
+                    Attach::Waiter {
+                        pct: entry.progress,
+                    }
+                }
+            }
         }
     }
 
-    /// Leader done: drop the entry and hand over waiter chats for fan-out.
-    /// A tap arriving after this becomes a new leader (and normally hits the
-    /// `file_id` cache instantly, since the leader caches before finishing).
-    pub async fn finish(&self, key: &FlightKey) -> Vec<ChatId> {
-        self.0.lock().await.remove(key).unwrap_or_default()
+    /// Register a waiter after its progress message is sent. Fails (caller
+    /// deletes the just-sent message) when the flight finished concurrently
+    /// or the chat attached twice in a race.
+    pub async fn add_waiter(&self, key: &FlightKey, waiter: FlightWaiter) -> bool {
+        let mut flights = self.0.lock().await;
+        match flights.get_mut(key) {
+            None => false,
+            Some(entry) => {
+                if entry.waiters.iter().any(|w| w.chat == waiter.chat) {
+                    false
+                } else {
+                    entry.waiters.push(waiter);
+                    true
+                }
+            }
+        }
+    }
+
+    /// Record the leader's progress message once sent (forwarder target).
+    pub async fn set_leader_msg(&self, key: &FlightKey, msg: MessageId) {
+        if let Some(entry) = self.0.lock().await.get_mut(key) {
+            entry.leader_msg = Some(msg);
+        }
+    }
+
+    /// Per-tick view for the progress forwarder: current leader target plus
+    /// a snapshot of waiter messages. `None` once the flight is finished.
+    pub async fn ticker_view(
+        &self,
+        key: &FlightKey,
+    ) -> Option<(ChatId, Option<MessageId>, Vec<FlightWaiter>)> {
+        self.0
+            .lock()
+            .await
+            .get(key)
+            .map(|e| (e.leader_chat, e.leader_msg, e.waiters.clone()))
+    }
+
+    /// Record freshly computed progress (scaled display value).
+    pub async fn set_progress(&self, key: &FlightKey, pct: u8) {
+        if let Some(entry) = self.0.lock().await.get_mut(key) {
+            entry.progress = pct;
+        }
+    }
+
+    /// Waiter ❌: detach by session. Returns the waiter for message cleanup.
+    pub async fn detach_waiter(&self, session: &str) -> Option<FlightWaiter> {
+        for entry in self.0.lock().await.values_mut() {
+            if let Some(pos) = entry.waiters.iter().position(|w| w.session == session) {
+                return Some(entry.waiters.remove(pos));
+            }
+        }
+        None
+    }
+
+    /// Leader ❌ with waiters remaining: oldest waiter inherits the job
+    /// (cancel authority + canonical progress target). The shared token is
+    /// NOT cancelled — the download continues for everyone attached.
+    pub async fn promote_oldest(&self, leader_session: &str) -> Option<Promoted> {
+        for entry in self.0.lock().await.values_mut() {
+            if entry.leader_session == leader_session && !entry.waiters.is_empty() {
+                let next = entry.waiters.remove(0);
+                let promoted = Promoted {
+                    old_chat: entry.leader_chat,
+                    old_msg: entry.leader_msg,
+                    new_session: next.session.clone(),
+                    new_chat: next.chat,
+                };
+                entry.leader_session = next.session;
+                entry.leader_chat = next.chat;
+                entry.leader_msg = Some(next.msg);
+                return Some(promoted);
+            }
+        }
+        None
+    }
+
+    /// Leader done: drop the entry; the caller fans the outcome out.
+    /// Returns the final leader session (for notice cleanup) plus waiters.
+    pub async fn finish(&self, key: &FlightKey) -> (String, Vec<FlightWaiter>) {
+        self.0
+            .lock()
+            .await
+            .remove(key)
+            .map_or((String::new(), Vec::new()), |e| {
+                (e.leader_session, e.waiters)
+            })
     }
 }
 
@@ -273,6 +410,7 @@ pub(crate) fn extract_url(text: &str) -> Option<String> {
 }
 
 /// Entry point for all callback queries.
+#[allow(clippy::too_many_lines)]
 pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Result<()> {
     let Some(data) = q.data.clone() else {
         return Ok(());
@@ -289,12 +427,41 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
         return Ok(());
     };
 
-    // ❌ Cancel: wired to the in-flight download token.
+    // ❌ Cancel: leader (or solo) cancel kills the shared token; waiter
+    // cancel detaches only them; leadership transfers while waiters remain.
     if data.starts_with("cancel:") {
-        let token = state.downloads.lock().await.remove(&session_id);
-        if let Some(t) = token {
-            t.cancel();
-            bot.answer_callback_query(q.id).text("Cancelling…").await?;
+        if let Some(token) = state.downloads.lock().await.remove(&session_id) {
+            if let Some(promoted) = state.flights.promote_oldest(&session_id).await {
+                // Someone else is still downloading: hand the job over
+                // instead of killing it. Same token, new cancel authority.
+                state
+                    .downloads
+                    .lock()
+                    .await
+                    .insert(promoted.new_session.clone(), token);
+                state.notify.lock().await.remove(&session_id);
+                state
+                    .notify
+                    .lock()
+                    .await
+                    .insert(promoted.new_session, promoted.new_chat);
+                if let Some(old_msg) = promoted.old_msg {
+                    let _ = bot.delete_message(promoted.old_chat, old_msg).await;
+                }
+                bot.answer_callback_query(q.id)
+                    .text("Passed to another tapper.")
+                    .await?;
+            } else {
+                token.cancel();
+                bot.answer_callback_query(q.id).text("Cancelling…").await?;
+            }
+        } else if let Some(waiter) = state.flights.detach_waiter(&session_id).await {
+            state.notify.lock().await.remove(&session_id);
+            let _ = state.sessions.delete(&session_id).await;
+            let _ = bot.delete_message(waiter.chat, waiter.msg).await;
+            bot.answer_callback_query(q.id)
+                .text("Removed from this download.")
+                .await?;
         } else {
             bot.answer_callback_query(q.id)
                 .text("Nothing to cancel.")
@@ -372,25 +539,54 @@ fn callback_origin(q: &CallbackQuery) -> Option<(ChatId, MessageId)> {
     }
 }
 
-/// Forward 0–100 download progress to a throttled Telegram progress message.
+/// Forward 0–100 download progress to the leader's progress message plus
+/// attached waiter mirrors.
 ///
 /// `scale_to` reserves headroom for later stages: video scales to 100,
 /// audio to 80 (the last 20% of the bar is convert + upload).
+///
+/// The leader target re-resolves every tick: a leadership transfer deletes
+/// the departed message (stale edits then fail silently) and the new target
+/// takes over with a fresh throttle. Waiter messages update on 10%
+/// milestones only, so a viral link can't multiply edits into 429s.
 fn spawn_progress_forwarder(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<u8>,
     bot: Bot,
-    chat: ChatId,
-    msg: MessageId,
+    flights: Flights,
+    key: FlightKey,
     prefix: &'static str,
     scale_to: u8,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut progress = crate::telegram::progress::Progress::new(bot, chat, msg);
+        let mut target: Option<(i64, i32)> = None;
+        let mut progress: Option<crate::telegram::progress::Progress> = None;
+        let mut last_waiter_pct: u8 = 0;
         while let Some(pct) = rx.recv().await {
             let scaled = u8::try_from(u16::from(pct) * u16::from(scale_to) / 100).unwrap_or(100);
-            progress
-                .update(&keyboard::progress_bar(prefix, scaled), false)
-                .await;
+            let Some((leader_chat, leader_msg, waiters)) = flights.ticker_view(&key).await else {
+                break;
+            };
+            flights.set_progress(&key, scaled).await;
+            let text = keyboard::progress_bar(prefix, scaled);
+            if let Some(msg) = leader_msg {
+                if target != Some((leader_chat.0, msg.0)) {
+                    progress = Some(crate::telegram::progress::Progress::new(
+                        bot.clone(),
+                        leader_chat,
+                        msg,
+                    ));
+                    target = Some((leader_chat.0, msg.0));
+                }
+                if let Some(editor) = progress.as_mut() {
+                    editor.update(&text, false).await;
+                }
+            }
+            if scaled >= last_waiter_pct.saturating_add(10) || scaled == 100 {
+                last_waiter_pct = scaled;
+                for w in waiters {
+                    let _ = bot.edit_message_text(w.chat, w.msg, &text).await;
+                }
+            }
         }
     })
 }
@@ -612,7 +808,8 @@ const FLIGHT_CANCELLED_NOTE: &str = "The download was cancelled.";
 const FLIGHT_FAILED_NOTE: &str = "Something went wrong. Try again later.";
 
 /// Leader done: unregister the flight and send the finished file to every
-/// attached waiter chat. Best-effort per chat; failures are logged.
+/// attached waiter chat, retiring their progress messages first (mirrors the
+/// leader path: delete progress, send file). Best-effort per chat.
 async fn fan_out_file(
     bot: &Bot,
     state: &AppState,
@@ -621,10 +818,13 @@ async fn fan_out_file(
     title: &str,
     file_id: &str,
 ) {
-    for chat in state.flights.finish(key).await {
+    let (leader_session, waiters) = state.flights.finish(key).await;
+    remove_flight_notices(state, &leader_session, &waiters).await;
+    for w in waiters {
+        let _ = bot.delete_message(w.chat, w.msg).await;
         let res = if format == "video" {
             bot.send_video(
-                chat,
+                w.chat,
                 InputFile::file_id(teloxide::types::FileId(file_id.to_owned())),
             )
             .caption(title.to_owned())
@@ -632,7 +832,7 @@ async fn fan_out_file(
             .map(|_| ())
         } else {
             bot.send_audio(
-                chat,
+                w.chat,
                 InputFile::file_id(teloxide::types::FileId(file_id.to_owned())),
             )
             .title(title.to_owned())
@@ -640,17 +840,71 @@ async fn fan_out_file(
             .map(|_| ())
         };
         if let Err(e) = res {
-            tracing::warn!("singleflight fan-out to {chat} failed: {e}");
+            tracing::warn!("singleflight fan-out to {} failed: {e}", w.chat.0);
         }
     }
 }
 
-/// Leader failed or gave up: unregister the flight and notify waiter chats.
+/// Leader failed or gave up: unregister the flight and edit waiter progress
+/// messages into the failure notice (mirrors the leader path: the progress
+/// message becomes the outcome, no corpse messages left behind).
 async fn fan_out_notice(bot: &Bot, state: &AppState, key: &FlightKey, notice: &str) {
-    for chat in state.flights.finish(key).await {
-        if let Err(e) = bot.send_message(chat, notice).await {
-            tracing::warn!("singleflight notice to {chat} failed: {e}");
+    let (leader_session, waiters) = state.flights.finish(key).await;
+    remove_flight_notices(state, &leader_session, &waiters).await;
+    for w in waiters {
+        if let Err(e) = bot.edit_message_text(w.chat, w.msg, notice).await {
+            tracing::warn!("singleflight notice to {} failed: {e}", w.chat.0);
         }
+    }
+}
+
+/// Drop shutdown-notice registrations for a finished flight. The leader
+/// session may differ from the pipeline's after a leadership transfer, and
+/// waiter sessions are only known here — single cleanup point for both.
+async fn remove_flight_notices(state: &AppState, leader_session: &str, waiters: &[FlightWaiter]) {
+    let mut notify = state.notify.lock().await;
+    notify.remove(leader_session);
+    for w in waiters {
+        notify.remove(&w.session);
+    }
+}
+
+/// Latecomer to a running flight: seed a progress message at the current
+/// value (❌ detaches only them) and register for fan-out. Racing the
+/// leader's finish cleans up after itself instead of leaving a dead bar.
+async fn attach_waiter(
+    bot: &Bot,
+    state: &AppState,
+    key: &FlightKey,
+    session_id: &str,
+    chat: ChatId,
+    pct: u8,
+) {
+    let msg = bot
+        .send_message(chat, keyboard::progress_bar("⬇️ Downloading", pct))
+        .reply_markup(keyboard::cancel_keyboard(session_id))
+        .await;
+    let Ok(msg) = msg else { return };
+    let registered = state
+        .flights
+        .add_waiter(
+            key,
+            FlightWaiter {
+                session: session_id.to_owned(),
+                chat,
+                msg: msg.id,
+            },
+        )
+        .await;
+    if registered {
+        state
+            .notify
+            .lock()
+            .await
+            .insert(session_id.to_owned(), chat);
+    } else {
+        let _ = bot.delete_message(chat, msg.id).await;
+        let _ = bot.send_message(chat, FLIGHT_WAIT_NOTE).await;
     }
 }
 
@@ -703,17 +957,26 @@ async fn run_video(
     }
 
     // Singleflight: an identical download already running serves this tap.
-    // Waiters hold no worker and no user slot; the leader fans the file out.
+    // Waiters mirror its progress and get the file fanned out; they hold no
+    // worker and no user slot.
     let flight_key = (
         session.url_hash.clone(),
         "video".to_owned(),
         quality_code.clone(),
     );
-    if !state.flights.attach_or_lead(&flight_key, chat).await {
-        release_user_slot(&state, user_id).await;
-        let _ = bot.send_message(chat, FLIGHT_WAIT_NOTE).await;
-        return;
-    }
+    let cancel = match state.flights.attach(&flight_key, &session_id, chat).await {
+        Attach::Leader => CancellationToken::new(),
+        Attach::Waiter { pct } => {
+            release_user_slot(&state, user_id).await;
+            attach_waiter(&bot, &state, &flight_key, &session_id, chat, pct).await;
+            return;
+        }
+        Attach::Duplicate => {
+            release_user_slot(&state, user_id).await;
+            let _ = bot.send_message(chat, FLIGHT_WAIT_NOTE).await;
+            return;
+        }
+    };
 
     // Queue when all workers are busy.
     // Register for shutdown notices first: parked waiters are invisible otherwise.
@@ -729,7 +992,6 @@ async fn run_video(
     let timeout_secs = state.config.download_timeout_secs;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
-    let cancel = CancellationToken::new();
     state
         .downloads
         .lock()
@@ -747,6 +1009,10 @@ async fn run_video(
         fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
         return;
     };
+    state
+        .flights
+        .set_leader_msg(&flight_key, progress_msg.id)
+        .await;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
 
     let work_dir = state.config.temp_dir.join(&session_id);
@@ -759,8 +1025,8 @@ async fn run_video(
     let progress_task = spawn_progress_forwarder(
         rx,
         bot.clone(),
-        chat,
-        progress_msg.id,
+        state.flights.clone(),
+        flight_key.clone(),
         "⬇️ Downloading",
         100,
     );
@@ -924,17 +1190,26 @@ async fn run_audio(
     }
 
     // Singleflight: an identical download already running serves this tap.
-    // Waiters hold no worker and no user slot; the leader fans the file out.
+    // Waiters mirror its progress and get the file fanned out; they hold no
+    // worker and no user slot.
     let flight_key = (
         session.url_hash.clone(),
         "audio".to_owned(),
         quality_code.clone(),
     );
-    if !state.flights.attach_or_lead(&flight_key, chat).await {
-        release_user_slot(&state, user_id).await;
-        let _ = bot.send_message(chat, FLIGHT_WAIT_NOTE).await;
-        return;
-    }
+    let cancel = match state.flights.attach(&flight_key, &session_id, chat).await {
+        Attach::Leader => CancellationToken::new(),
+        Attach::Waiter { pct } => {
+            release_user_slot(&state, user_id).await;
+            attach_waiter(&bot, &state, &flight_key, &session_id, chat, pct).await;
+            return;
+        }
+        Attach::Duplicate => {
+            release_user_slot(&state, user_id).await;
+            let _ = bot.send_message(chat, FLIGHT_WAIT_NOTE).await;
+            return;
+        }
+    };
 
     // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
@@ -949,7 +1224,6 @@ async fn run_audio(
     let timeout_secs = state.config.download_timeout_secs;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
-    let cancel = CancellationToken::new();
     state
         .downloads
         .lock()
@@ -967,6 +1241,10 @@ async fn run_audio(
         fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
         return;
     };
+    state
+        .flights
+        .set_leader_msg(&flight_key, progress_msg.id)
+        .await;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
 
     let work_dir = state.config.temp_dir.join(&session_id);
@@ -977,8 +1255,14 @@ async fn run_audio(
         url: session.url.clone(),
     };
 
-    let progress_task =
-        spawn_progress_forwarder(rx, bot.clone(), chat, progress_msg.id, "⬇️ Downloading", 80);
+    let progress_task = spawn_progress_forwarder(
+        rx,
+        bot.clone(),
+        state.flights.clone(),
+        flight_key.clone(),
+        "⬇️ Downloading",
+        80,
+    );
 
     let download = with_deadline(
         deadline,
@@ -1331,27 +1615,76 @@ mod tests {
         (hash.to_owned(), format.to_owned(), quality.to_owned())
     }
 
+    fn is_leader(a: &Attach) -> bool {
+        matches!(a, Attach::Leader)
+    }
+
+    fn is_waiter(a: &Attach) -> bool {
+        matches!(a, Attach::Waiter { .. })
+    }
+
+    async fn add_test_waiter(flights: &Flights, key: &FlightKey, session: &str, chat: i64) {
+        assert!(
+            flights
+                .add_waiter(
+                    key,
+                    FlightWaiter {
+                        session: session.to_owned(),
+                        chat: ChatId(chat),
+                        msg: MessageId(1),
+                    },
+                )
+                .await
+        );
+    }
+
     #[tokio::test]
     async fn flight_first_tapper_leads_rest_wait() {
         let flights = Flights::default();
         let key = flight_key("hash", "video", "720");
-        assert!(flights.attach_or_lead(&key, ChatId(1)).await);
-        assert!(!flights.attach_or_lead(&key, ChatId(2)).await);
+        assert!(is_leader(&flights.attach(&key, "s1", ChatId(1)).await));
+        assert!(is_waiter(&flights.attach(&key, "s2", ChatId(2)).await));
+        add_test_waiter(&flights, &key, "s2", 2).await;
+        // Same chat taps again: no second bar.
+        assert!(matches!(
+            flights.attach(&key, "s3", ChatId(2)).await,
+            Attach::Duplicate
+        ));
+        assert!(matches!(
+            flights.attach(&key, "s4", ChatId(1)).await,
+            Attach::Duplicate
+        ));
         // Different qualities still download independently.
         let other = flight_key("hash", "video", "1080");
-        assert!(flights.attach_or_lead(&other, ChatId(3)).await);
+        assert!(is_leader(&flights.attach(&other, "s5", ChatId(3)).await));
     }
 
     #[tokio::test]
     async fn flight_finish_hands_over_waiters_and_releases_key() {
         let flights = Flights::default();
         let key = flight_key("hash", "audio", "320");
-        assert!(flights.attach_or_lead(&key, ChatId(1)).await);
-        assert!(!flights.attach_or_lead(&key, ChatId(2)).await);
-        assert!(!flights.attach_or_lead(&key, ChatId(3)).await);
-        assert_eq!(flights.finish(&key).await, vec![ChatId(2), ChatId(3)]);
+        assert!(is_leader(&flights.attach(&key, "s1", ChatId(1)).await));
+        assert!(is_waiter(&flights.attach(&key, "s2", ChatId(2)).await));
+        add_test_waiter(&flights, &key, "s2", 2).await;
+        add_test_waiter(&flights, &key, "s3", 3).await;
+        // Registration is atomic: the same chat can't attach twice.
+        assert!(
+            !flights
+                .add_waiter(
+                    &key,
+                    FlightWaiter {
+                        session: "s9".to_owned(),
+                        chat: ChatId(2),
+                        msg: MessageId(9),
+                    },
+                )
+                .await
+        );
+        let (leader, waiters) = flights.finish(&key).await;
+        assert_eq!(leader, "s1");
+        assert_eq!(waiters.len(), 2);
         // Key released: the next tapper leads again.
-        assert!(flights.attach_or_lead(&key, ChatId(4)).await);
+        assert!(is_leader(&flights.attach(&key, "s4", ChatId(4)).await));
     }
 
     #[tokio::test]
@@ -1362,15 +1695,63 @@ mod tests {
         for i in 0..10 {
             let registry = flights.clone();
             let tapped = key.clone();
-            set.spawn(async move { registry.attach_or_lead(&tapped, ChatId(i)).await });
+            set.spawn(async move {
+                (
+                    i,
+                    registry.attach(&tapped, &format!("s{i}"), ChatId(i)).await,
+                )
+            });
         }
         let mut leaders = 0;
+        let mut waiter_sessions = Vec::new();
         while let Some(res) = set.join_next().await {
-            if res.expect("tap task") {
-                leaders += 1;
+            let (i, outcome) = res.expect("tap task");
+            match outcome {
+                Attach::Leader => leaders += 1,
+                Attach::Waiter { .. } => waiter_sessions.push(i),
+                Attach::Duplicate => panic!("distinct chats must not duplicate"),
             }
         }
         assert_eq!(leaders, 1, "10 concurrent taps = 1 download");
-        assert_eq!(flights.finish(&key).await.len(), 9);
+        for i in waiter_sessions {
+            add_test_waiter(&flights, &key, &format!("s{i}"), i).await;
+        }
+        assert_eq!(flights.finish(&key).await.1.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn flight_waiter_detaches_by_session() {
+        let flights = Flights::default();
+        let key = flight_key("hash", "video", "720");
+        assert!(is_leader(&flights.attach(&key, "s1", ChatId(1)).await));
+        assert!(is_waiter(&flights.attach(&key, "s2", ChatId(2)).await));
+        add_test_waiter(&flights, &key, "s2", 2).await;
+        let detached = flights.detach_waiter("s2").await.expect("waiter");
+        assert_eq!(detached.chat, ChatId(2));
+        assert!(flights.detach_waiter("s2").await.is_none());
+        assert!(
+            flights.detach_waiter("s1").await.is_none(),
+            "leader is not a waiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn flight_leader_cancel_promotes_oldest_waiter() {
+        let flights = Flights::default();
+        let key = flight_key("hash", "video", "720");
+        assert!(is_leader(&flights.attach(&key, "s1", ChatId(1)).await));
+        flights.set_leader_msg(&key, MessageId(10)).await;
+        assert!(is_waiter(&flights.attach(&key, "s2", ChatId(2)).await));
+        add_test_waiter(&flights, &key, "s2", 2).await;
+        assert!(is_waiter(&flights.attach(&key, "s3", ChatId(3)).await));
+        add_test_waiter(&flights, &key, "s3", 3).await;
+        let promoted = flights.promote_oldest("s1").await.expect("promotion");
+        assert_eq!(promoted.new_session, "s2");
+        assert_eq!(promoted.old_msg, Some(MessageId(10)));
+        // No waiters left for a solo leader: no promotion, token must die.
+        let solo = flight_key("other", "video", "720");
+        assert!(is_leader(&flights.attach(&solo, "s9", ChatId(9)).await));
+        assert!(flights.promote_oldest("s9").await.is_none());
+        assert!(flights.promote_oldest("unknown").await.is_none());
     }
 }
