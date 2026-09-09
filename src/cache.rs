@@ -3,18 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
 
-/// Durable `{url_hash, format, quality} → telegram file_id` cache.
-///
-/// `rusqlite` is synchronous, so every method runs the query on a blocking
-/// thread via `spawn_blocking`. Never call `rusqlite` directly on a tokio
-/// worker thread.
+/// `rusqlite` is synchronous: every method runs on a blocking thread, never on a tokio worker.
 #[derive(Debug, Clone)]
 pub struct FileCache {
     inner: Arc<Mutex<rusqlite::Connection>>,
 }
 
 impl FileCache {
-    /// Open (creating parent dirs) and run migrations.
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -49,7 +44,6 @@ impl FileCache {
         })
     }
 
-    /// Open an in-memory DB (tests).
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let conn = rusqlite::Connection::open_in_memory()?;
@@ -146,7 +140,6 @@ mod tests {
             cache.get("h", "video", "720").await.expect("get"),
             Some("FILE123".to_owned())
         );
-        // Different quality misses.
         assert_eq!(cache.get("h", "video", "1080").await.expect("get"), None);
     }
 }

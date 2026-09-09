@@ -1,6 +1,5 @@
 use crate::error::{Error, Result};
 
-/// Platform detected from a URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
@@ -22,15 +21,12 @@ impl Platform {
     }
 }
 
-/// A URL that passed platform detection, ready for yt-dlp.
 #[derive(Debug, Clone)]
 pub struct MediaUrl {
     pub platform: Platform,
-    /// Normalized URL string (scheme + host lowercased, tracking params stripped).
     pub url: String,
 }
 
-/// Detect platform from host. Returns `None` for unsupported hosts.
 fn detect_platform(host: &str) -> Option<Platform> {
     let h = host.strip_prefix("www.").unwrap_or(host);
     match h {
@@ -60,15 +56,11 @@ fn detect_platform(host: &str) -> Option<Platform> {
     }
 }
 
-/// Parse + normalize a user-supplied URL.
-///
-/// Strips common tracking params (`si`, `utm_*`, `igsh`, `fbclid`, …) so the
-/// same content maps to the same cache key regardless of share-link noise.
+/// Tracking params are stripped so the same content maps to the same cache key.
 pub fn parse(input: &str) -> Result<MediaUrl> {
     let input = input.trim();
     let mut parsed = url::Url::parse(input).map_err(|_| Error::UnsupportedUrl)?;
 
-    // Accept bare `youtu.be/…` etc. pasted without scheme.
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err(Error::UnsupportedUrl);
     }
@@ -79,10 +71,8 @@ pub fn parse(input: &str) -> Result<MediaUrl> {
         .to_lowercase();
     let platform = detect_platform(&host).ok_or(Error::UnsupportedUrl)?;
 
-    // Normalize host case.
     let _ = parsed.set_host(Some(&host));
 
-    // Strip tracking query params (keep the rest, e.g. `v=`, `t=`).
     {
         let drop: Vec<String> = parsed
             .query_pairs()
@@ -120,7 +110,6 @@ pub fn parse(input: &str) -> Result<MediaUrl> {
     })
 }
 
-/// Stable cache key for a URL: lowercase hex SHA-256.
 #[must_use]
 pub fn url_hash(url: &str) -> String {
     use sha2::{Digest, Sha256};

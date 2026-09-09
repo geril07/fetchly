@@ -3,11 +3,9 @@ use std::time::{Duration, Instant};
 use teloxide::prelude::*;
 use teloxide::types::{ChatId, MessageId};
 
-/// Minimum time between `editMessageText` calls (Telegram per-chat limit is
-/// ~1 msg/s; 3 s keeps us far below it while still feeling live).
+/// Telegram allows ~1 msg/s per chat; 3 s stays far below it while still feeling live.
 const EDIT_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Pure throttle decision, extracted for tests.
 fn should_edit(last_edit: Option<Instant>, now: Instant, text_changed: bool, force: bool) -> bool {
     if force {
         return true;
@@ -18,8 +16,7 @@ fn should_edit(last_edit: Option<Instant>, now: Instant, text_changed: bool, for
     last_edit.is_none_or(|t| now.duration_since(t) >= EDIT_INTERVAL)
 }
 
-/// Throttled progress editor: at most one `editMessageText` per [`EDIT_INTERVAL`].
-/// The final 100% update always goes through (`force=true`).
+/// At most one `editMessageText` per [`EDIT_INTERVAL`]; `force=true` always goes through (final 100%).
 pub struct Progress {
     bot: Bot,
     chat: ChatId,
@@ -39,8 +36,6 @@ impl Progress {
         }
     }
 
-    /// Edit the message if `text` changed and the throttle window elapsed.
-    /// Set `force=true` for the final update.
     pub async fn update(&mut self, text: &str, force: bool) {
         if !should_edit(
             self.last_edit,
@@ -85,7 +80,6 @@ mod tests {
         let old = base.checked_sub(Duration::from_secs(4));
         assert!(!should_edit(recent, base, true, false));
         assert!(should_edit(old, base, true, false));
-        // Forced final update bypasses the window.
         assert!(should_edit(recent, base, true, true));
     }
 }

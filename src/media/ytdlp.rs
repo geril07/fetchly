@@ -8,10 +8,8 @@ use crate::error::{Error, Result};
 use crate::i18n::Lang;
 use crate::media::url::{MediaUrl, Platform};
 
-/// Channel for download progress (0–100).
 pub type ProgressTx = tokio::sync::mpsc::UnboundedSender<u8>;
 
-/// Video quality offered to the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VideoQuality {
     P360,
@@ -44,7 +42,6 @@ impl VideoQuality {
         }
     }
 
-    /// Parse the short callback code (`360`, `480`, `720`, `1080`, `best`).
     pub fn parse_code(s: &str) -> Option<Self> {
         match s {
             "360" => Some(Self::P360),
@@ -56,7 +53,6 @@ impl VideoQuality {
         }
     }
 
-    /// yt-dlp `-f` selector that caps height at the requested quality.
     #[must_use]
     pub fn format_selector(self) -> &'static str {
         match self {
@@ -69,7 +65,6 @@ impl VideoQuality {
     }
 }
 
-/// Audio quality offered to the user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AudioQuality {
     K128,
@@ -109,7 +104,6 @@ impl AudioQuality {
         }
     }
 
-    /// ffmpeg `-b:a` value for the final MP3.
     #[must_use]
     pub fn mp3_bitrate(self) -> &'static str {
         match self {
@@ -120,21 +114,18 @@ impl AudioQuality {
     }
 }
 
-/// One video quality option with an estimated size (from metadata, if known).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct VideoOption {
     pub quality: VideoQuality,
     pub estimated_bytes: Option<u64>,
 }
 
-/// One audio quality option with an estimated size.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AudioOption {
     pub quality: AudioQuality,
     pub estimated_bytes: Option<u64>,
 }
 
-/// Metadata resolved from a URL via `yt-dlp --dump-single-json`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Metadata {
     pub title: String,
@@ -158,7 +149,7 @@ impl Metadata {
     }
 }
 
-/// Resolve metadata with yt-dlp. No file is downloaded.
+/// No file is downloaded.
 pub async fn resolve(media: &MediaUrl) -> Result<Metadata> {
     let out = tokio::process::Command::new("yt-dlp")
         .args([
@@ -184,8 +175,6 @@ pub async fn resolve(media: &MediaUrl) -> Result<Metadata> {
     Ok(metadata_from_json(&json, media))
 }
 
-/// Largest observed file size per video height, plus the largest pure-audio
-/// size (used to scale audio bitrate estimates). Pure helper over yt-dlp JSON.
 fn parse_format_sizes(v: &serde_json::Value) -> (std::collections::HashMap<u32, u64>, Option<u64>) {
     let mut best_for_height: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     let mut best_audio: Option<u64> = None;
@@ -209,7 +198,6 @@ fn parse_format_sizes(v: &serde_json::Value) -> (std::collections::HashMap<u32, 
                     .or_insert(size);
             }
         }
-        // Pure-audio formats contribute to the audio estimate.
         if vcodec == Some("none") && acodec != Some("none") {
             if let Some(size) = filesize {
                 best_audio = Some(best_audio.map_or(size, |b| b.max(size)));
@@ -219,21 +207,18 @@ fn parse_format_sizes(v: &serde_json::Value) -> (std::collections::HashMap<u32, 
     (best_for_height, best_audio)
 }
 
-/// yt-dlp durations are non-negative finite seconds. The saturating `as`
-/// cast maps `NaN`/negatives to 0 and huge values to `u64::MAX`,
-/// which is the desired behavior for display purposes.
+/// Saturating `as` maps `NaN`/negatives to 0 and huge values to `u64::MAX`, which suits display.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn duration_to_secs(f: f64) -> u64 {
     f.round().max(0.0) as u64
 }
 
-/// Input is clamped to 0–100 first, so the conversion is exact.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn percent_to_u8(f: f64) -> u8 {
     f.clamp(0.0, 100.0).round() as u8
 }
 
-/// Build [`Metadata`] from yt-dlp JSON. Pure (testable without the binary).
+/// Pure (testable without the binary).
 pub fn metadata_from_json(v: &serde_json::Value, media: &MediaUrl) -> Metadata {
     let title = v
         .get("title")
@@ -260,14 +245,11 @@ pub fn metadata_from_json(v: &serde_json::Value, media: &MediaUrl) -> Metadata {
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
 
-    // Estimate per-height sizes from the formats list.
     let (best_for_height, best_audio) = parse_format_sizes(v);
 
-    // Fall back to duration × bitrate when formats carry no sizes.
     let audio_estimate = |kbps: u64| -> Option<u64> {
         if let Some(b) = best_audio {
-            // Scale the observed best-audio size to the requested bitrate
-            // (assume the observed file is ~192 kbps when unknown).
+            // Observed bitrate unknown, assume ~192 kbps.
             Some(b * kbps / 192)
         } else {
             duration_secs.map(|d| d * kbps * 1000 / 8)
@@ -338,7 +320,7 @@ pub fn metadata_from_json(v: &serde_json::Value, media: &MediaUrl) -> Metadata {
     }
 }
 
-/// Map yt-dlp stderr to a user-facing error.
+/// yt-dlp stderr shape is unstable; the user message stays generic.
 pub fn classify_ytdlp_error(stderr: &str) -> Error {
     let lower = stderr.to_lowercase();
     if lower.contains("private")
@@ -354,14 +336,12 @@ pub fn classify_ytdlp_error(stderr: &str) -> Error {
     } else if lower.contains("file is larger than") || lower.contains("larger than the maximum") {
         Error::TooLarge
     } else {
-        // Truncate raw tool output; the user message stays generic.
         let snippet: String = stderr.chars().take(300).collect();
         Error::Download(snippet)
     }
 }
 
-/// Parse a yt-dlp `--progress-template` line like `download: 82.3%`.
-/// Returns 0–100 or `None` when the line carries no progress.
+/// Expects `download: 82.3%` (`--progress-template`); `None` when the line carries no progress.
 #[must_use]
 pub fn parse_progress_line(line: &str) -> Option<u8> {
     let (_, pct) = line.split_once(':')?;
@@ -376,7 +356,6 @@ pub fn parse_progress_line(line: &str) -> Option<u8> {
     Some(percent_to_u8(f))
 }
 
-/// Download video with yt-dlp, merging to MP4. Returns the final file path.
 pub async fn download_video(
     media: &MediaUrl,
     quality: VideoQuality,
@@ -387,7 +366,7 @@ pub async fn download_video(
     if let Some(parent) = out_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    // yt-dlp appends the extension when merging; use a template without one.
+    // yt-dlp appends the extension on merge, so the template carries none.
     let template = out_path.with_extension("").to_string_lossy().into_owned();
 
     let mut child = tokio::process::Command::new("yt-dlp")
@@ -441,12 +420,10 @@ pub async fn download_video(
     }
 
     if !status.success() {
-        // Re-run is wasteful; surface a generic failure (stderr already consumed
-        // for progress, so we cannot reliably classify here).
+        // stderr is piped to progress, so classification is unreliable here.
         return Err(Error::Download("yt-dlp exited with an error".to_owned()));
     }
 
-    // Find the merged output (`.mp4` preferred).
     for ext in ["mp4", "mkv", "webm"] {
         let candidate = out_path.with_extension(ext);
         if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
@@ -457,7 +434,7 @@ pub async fn download_video(
     Err(Error::Download("yt-dlp produced no file".to_owned()))
 }
 
-/// Download best-audio source (no conversion). Caller runs ffmpeg next.
+/// Caller runs ffmpeg next.
 pub async fn download_audio_source(
     media: &MediaUrl,
     out_path: &Path,
@@ -520,7 +497,6 @@ pub async fn download_audio_source(
         return Err(Error::Download("yt-dlp exited with an error".to_owned()));
     }
 
-    // Pick whatever audio container yt-dlp produced.
     let mut found: Option<PathBuf> = None;
     let mut dir = tokio::fs::read_dir(out_path.parent().unwrap_or(Path::new("."))).await?;
     let stem = out_path
@@ -544,7 +520,7 @@ pub async fn download_audio_source(
     }
 }
 
-/// Telegram caps Bot API uploads at 2 GB (Local Server). Reject larger files.
+/// Bot API uploads cap at 2 GB even via Local Server; larger files are rejected.
 async fn enforce_size_limit(path: &Path) -> Result<()> {
     let meta = tokio::fs::metadata(path).await?;
     if meta.len() > 2_000_000_000 {
@@ -626,7 +602,6 @@ mod tests {
         assert_eq!(m.duration_secs, Some(240));
         assert_eq!(m.video_options.len(), 5);
         assert_eq!(m.audio_options.len(), 4);
-        // Duration-based fallback: 240 s × 320 kbps / 8 = 9.6 MB.
         let best = m
             .audio_options
             .iter()

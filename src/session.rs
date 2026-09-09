@@ -3,11 +3,7 @@ use redis::AsyncCommands;
 use crate::error::{Error, Result};
 use crate::media::ytdlp::Metadata;
 
-/// Ephemeral per-preview state, kept between button presses.
-///
-/// Telegram callback data is limited to 64 bytes, so callbacks carry only
-/// `v:720:<session_id>` / `a:320:<session_id>` and the full [`Metadata`]
-/// lives here with a 10-minute TTL.
+/// Callbacks carry only `v:720:<id>` (64-byte Telegram cap); full [`Metadata`] lives here with a 10-min TTL.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
     manager: redis::aio::ConnectionManager,
@@ -22,7 +18,6 @@ impl SessionStore {
         format!("session:{session_id}")
     }
 
-    /// Store metadata, returning the generated 8-char session ID.
     pub async fn create(&self, url_hash: &str, url: &str, metadata: &Metadata) -> Result<String> {
         let session_id = new_session_id();
         let payload = serde_json::json!({
@@ -62,7 +57,6 @@ impl SessionStore {
     }
 }
 
-/// What [`SessionStore::get`] returns.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredSession {
     pub url_hash: String,
@@ -74,8 +68,6 @@ fn new_session_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..8].to_owned()
 }
 
-/// Parse callback data `v:720:<session_id>` / `a:320:<session_id>` / `cancel:<session_id>`.
-///
 /// Returns `(kind, quality_code, session_id)`.
 pub fn parse_callback(data: &str) -> Option<(char, String, String)> {
     let mut parts = data.splitn(3, ':');
@@ -118,7 +110,6 @@ mod tests {
 
     #[test]
     fn callback_fits_telegram_limit() {
-        // Telegram caps callback_data at 64 bytes.
         for data in ["v:720:abcdefgh", "a:best:abcdefgh", "cancel:x:abcdefgh"] {
             assert!(data.len() <= 64, "{data}");
         }
@@ -139,9 +130,7 @@ mod tests {
         }
     }
 
-    /// Each test spins its own Redis; skips (loudly) without Docker.
-    /// The returned guard keeps the container alive for the whole test —
-    /// dropping it kills Redis, so bind it in the test body.
+    /// Dropping the guard kills Redis, so bind it in the test body.
     async fn test_redis() -> Option<crate::testutil::TestRedis> {
         crate::testutil::start_redis().await
     }
