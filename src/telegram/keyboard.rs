@@ -1,26 +1,37 @@
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup};
 
+use crate::i18n::Lang;
 use crate::media::ytdlp::Metadata;
 
 /// Preview card buttons: `[🎬 Video] [🎵 Audio]`.
 #[must_use]
-pub fn preview_keyboard(session_id: &str) -> InlineKeyboardMarkup {
+pub fn preview_keyboard(session_id: &str, lang: Lang) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([[
-        InlineKeyboardButton::callback("🎬 Video", format!("v:pick:{session_id}")),
-        InlineKeyboardButton::callback("🎵 Audio", format!("a:pick:{session_id}")),
+        InlineKeyboardButton::callback(
+            crate::i18n::video_button(lang),
+            format!("v:pick:{session_id}"),
+        ),
+        InlineKeyboardButton::callback(
+            crate::i18n::audio_button(lang),
+            format!("a:pick:{session_id}"),
+        ),
     ]])
 }
 
 /// Quality picker for video. Each button shows `720p — ~42 MB` when known.
 #[must_use]
-pub fn video_quality_keyboard(meta: &Metadata, session_id: &str) -> InlineKeyboardMarkup {
+pub fn video_quality_keyboard(
+    meta: &Metadata,
+    session_id: &str,
+    lang: Lang,
+) -> InlineKeyboardMarkup {
     let mut rows: Vec<Vec<InlineKeyboardButton>> = meta
         .video_options
         .iter()
         .map(|opt| {
             let label = match opt.estimated_bytes {
-                Some(b) => format!("{} — ~{}", opt.quality.label(), format_bytes(b)),
-                None => opt.quality.label().to_owned(),
+                Some(b) => format!("{} — ~{}", opt.quality.label(lang), format_bytes(b)),
+                None => opt.quality.label(lang).to_owned(),
             };
             vec![InlineKeyboardButton::callback(
                 label,
@@ -29,7 +40,7 @@ pub fn video_quality_keyboard(meta: &Metadata, session_id: &str) -> InlineKeyboa
         })
         .collect();
     rows.push(vec![InlineKeyboardButton::callback(
-        "❌ Cancel",
+        crate::i18n::cancel_button(lang),
         format!("cancel:x:{session_id}"),
     )]);
     InlineKeyboardMarkup::new(rows)
@@ -37,14 +48,18 @@ pub fn video_quality_keyboard(meta: &Metadata, session_id: &str) -> InlineKeyboa
 
 /// Quality picker for audio.
 #[must_use]
-pub fn audio_quality_keyboard(meta: &Metadata, session_id: &str) -> InlineKeyboardMarkup {
+pub fn audio_quality_keyboard(
+    meta: &Metadata,
+    session_id: &str,
+    lang: Lang,
+) -> InlineKeyboardMarkup {
     let mut rows: Vec<Vec<InlineKeyboardButton>> = meta
         .audio_options
         .iter()
         .map(|opt| {
             let label = match opt.estimated_bytes {
-                Some(b) => format!("{} — ~{}", opt.quality.label(), format_bytes(b)),
-                None => opt.quality.label().to_owned(),
+                Some(b) => format!("{} — ~{}", opt.quality.label(lang), format_bytes(b)),
+                None => opt.quality.label(lang).to_owned(),
             };
             vec![InlineKeyboardButton::callback(
                 label,
@@ -53,7 +68,7 @@ pub fn audio_quality_keyboard(meta: &Metadata, session_id: &str) -> InlineKeyboa
         })
         .collect();
     rows.push(vec![InlineKeyboardButton::callback(
-        "❌ Cancel",
+        crate::i18n::cancel_button(lang),
         format!("cancel:x:{session_id}"),
     )]);
     InlineKeyboardMarkup::new(rows)
@@ -61,11 +76,20 @@ pub fn audio_quality_keyboard(meta: &Metadata, session_id: &str) -> InlineKeyboa
 
 /// Single cancel button shown under the progress message during download.
 #[must_use]
-pub fn cancel_keyboard(session_id: &str) -> InlineKeyboardMarkup {
+pub fn cancel_keyboard(session_id: &str, lang: Lang) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new([[InlineKeyboardButton::callback(
-        "❌ Cancel",
+        crate::i18n::cancel_button(lang),
         format!("cancel:x:{session_id}"),
     )]])
+}
+
+/// Language picker for `/language`: `[English] [Русский]`.
+#[must_use]
+pub fn language_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new([
+        [InlineKeyboardButton::callback("English", "lang:en")],
+        [InlineKeyboardButton::callback("Русский", "lang:ru")],
+    ])
 }
 
 /// Human-readable byte count: `42 MB`, `3.1 GB`, `512 KB`.
@@ -89,11 +113,15 @@ pub fn format_bytes(bytes: u64) -> String {
 
 /// Preview card text: `{title}\n{duration} · {platform} · {views}`.
 #[must_use]
-pub fn preview_text(meta: &Metadata) -> String {
+pub fn preview_text(meta: &Metadata, lang: Lang) -> String {
     use std::fmt::Write as _;
-    let mut line2 = format!("{} · {}", meta.duration_label(), meta.platform.as_str());
+    let duration = match meta.duration_secs {
+        Some(_) => meta.duration_label(),
+        None => crate::i18n::live_unknown(lang).to_owned(),
+    };
+    let mut line2 = format!("{} · {}", duration, meta.platform.as_str());
     if let Some(views) = meta.view_count {
-        let _ = write!(line2, " · {}", format_views(views));
+        let _ = write!(line2, " · {}", crate::i18n::views(lang, views));
     }
     if let Some(uploader) = &meta.uploader {
         if !uploader.is_empty() {
@@ -101,20 +129,6 @@ pub fn preview_text(meta: &Metadata) -> String {
         }
     }
     format!("{}\n{line2}", escape_caption(&meta.title))
-}
-
-fn format_views(views: u64) -> String {
-    if views >= 1_000_000 {
-        format!(
-            "{}.{}M views",
-            views / 1_000_000,
-            (views % 1_000_000) / 100_000
-        )
-    } else if views >= 1_000 {
-        format!("{}.{}K views", views / 1_000, (views % 1_000) / 100)
-    } else {
-        format!("{views} views")
-    }
 }
 
 /// Escape text for Telegram HTML parse mode (we send captions as HTML).
@@ -165,17 +179,21 @@ mod tests {
     #[test]
     fn callbacks_fit_limit() {
         let sid = "abcdefgh";
-        for markup in [
-            preview_keyboard(sid),
-            video_quality_keyboard(&meta(), sid),
-            audio_quality_keyboard(&meta(), sid),
-            cancel_keyboard(sid),
-        ] {
-            for row in markup.inline_keyboard {
-                for btn in row {
-                    if let teloxide::types::InlineKeyboardButtonKind::CallbackData(data) = &btn.kind
-                    {
-                        assert!(data.len() <= 64, "{data}");
+        for lang in [Lang::En, Lang::Ru] {
+            for markup in [
+                preview_keyboard(sid, lang),
+                video_quality_keyboard(&meta(), sid, lang),
+                audio_quality_keyboard(&meta(), sid, lang),
+                cancel_keyboard(sid, lang),
+                language_keyboard(),
+            ] {
+                for row in markup.inline_keyboard {
+                    for btn in row {
+                        if let teloxide::types::InlineKeyboardButtonKind::CallbackData(data) =
+                            &btn.kind
+                        {
+                            assert!(data.len() <= 64, "{data}");
+                        }
                     }
                 }
             }
@@ -197,21 +215,15 @@ mod tests {
     }
 
     #[test]
-    fn views_format() {
-        assert_eq!(format_views(999), "999 views");
-        assert_eq!(format_views(1_000), "1.0K views");
-        assert_eq!(format_views(12_345), "12.3K views");
-        assert_eq!(format_views(1_000_000), "1.0M views");
-        assert_eq!(format_views(1_500_000), "1.5M views");
-    }
-
-    #[test]
     fn preview_card_text() {
-        let text = preview_text(&meta());
+        let text = preview_text(&meta(), Lang::En);
         assert!(text.starts_with("T\n"), "{text}");
         assert!(text.contains("1:00"), "{text}");
         assert!(text.contains("YouTube"), "{text}");
         assert!(text.contains("1.5M views"), "{text}");
+
+        let ru = preview_text(&meta(), Lang::Ru);
+        assert!(ru.contains("1.5 млн просмотров"), "{ru}");
     }
 
     #[test]
@@ -220,8 +232,18 @@ mod tests {
         m.title = "A<B>&\"C\"".to_owned();
         m.view_count = None;
         m.uploader = None;
-        let text = preview_text(&m);
+        let text = preview_text(&m, Lang::En);
         assert!(text.contains("A&lt;B&gt;&amp;"), "{text}");
         assert!(!text.contains("views"), "{text}");
+    }
+
+    #[test]
+    fn preview_live_label_localized() {
+        let mut m = meta();
+        m.duration_secs = None;
+        m.view_count = None;
+        m.uploader = None;
+        assert!(preview_text(&m, Lang::En).contains("live/unknown"));
+        assert!(preview_text(&m, Lang::Ru).contains("эфир/неизвестно"));
     }
 }
