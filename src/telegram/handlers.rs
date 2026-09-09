@@ -757,7 +757,11 @@ async fn fan_out_notice(bot: &Bot, state: &AppState, key: &FlightKey, notice: &s
     }
 }
 
-/// Video download pipeline: rate limit → cache → semaphore → yt-dlp → upload.
+/// Video download pipeline: cache → user slot → singleflight → rate limit → semaphore → yt-dlp → upload.
+///
+/// Quota is consumed only after cache, per-user cap, and dedup all pass, so
+/// rejected taps never burn hourly quota. Post-consume admission failures
+/// (global queue full, progress message failure) refund the unit.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_video(
     bot: Bot,
@@ -771,12 +775,7 @@ async fn run_video(
 ) {
     let quality_code = quality.as_str().to_owned();
 
-    if let Err(e) = state.limiter.check_and_consume(user_id).await {
-        respond(bot, chat, e).await;
-        return;
-    }
-
-    // Instant path: same URL+format+quality seen before.
+    // Instant path: same URL+format+quality seen before. No slot, no quota.
     if let Ok(Some(file_id)) = state
         .cache
         .get(&session.url_hash, "video", &quality_code)
@@ -793,6 +792,7 @@ async fn run_video(
     }
 
     // One user must not hold every worker: queued + running count toward the cap.
+    // Before quota: a capped tap is rejected without burning hourly downloads.
     if !acquire_user_slot(&state, user_id).await {
         respond(
             bot,
@@ -807,6 +807,7 @@ async fn run_video(
 
     // Singleflight: an identical download already running serves this tap.
     // Waiters hold no worker and no user slot; the leader fans the file out.
+    // Before quota: deduped waiters consume nothing.
     let flight_key = (
         session.url_hash.clone(),
         "video".to_owned(),
@@ -818,12 +819,20 @@ async fn run_video(
         return;
     }
 
+    if let Err(e) = state.limiter.check_and_consume(user_id).await {
+        release_user_slot(&state, user_id).await;
+        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
+        respond(bot, chat, e).await;
+        return;
+    }
+
     // Queue when all workers are busy.
     // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
     let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state).await else {
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
+        let _ = state.limiter.refund(user_id).await;
         fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
         return;
     };
@@ -847,6 +856,7 @@ async fn run_video(
         state.downloads.lock().await.remove(&session_id);
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
+        let _ = state.limiter.refund(user_id).await;
         fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
         return;
     };
@@ -980,7 +990,10 @@ async fn upload_video(
     }
 }
 
-/// Audio pipeline: rate limit → cache → semaphore → yt-dlp → ffmpeg → tag → upload.
+/// Audio pipeline: cache → user slot → singleflight → rate limit → semaphore → yt-dlp → ffmpeg → tag → upload.
+///
+/// Same admission order as [`run_video`]: rejected, deduped, or cached taps
+/// never consume hourly quota; post-consume admission failures refund.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_audio(
     bot: Bot,
@@ -993,11 +1006,6 @@ async fn run_audio(
     state: AppState,
 ) {
     let quality_code = quality.as_str().to_owned();
-
-    if let Err(e) = state.limiter.check_and_consume(user_id).await {
-        respond(bot, chat, e).await;
-        return;
-    }
 
     if let Ok(Some(file_id)) = state
         .cache
@@ -1014,6 +1022,7 @@ async fn run_audio(
     }
 
     // One user must not hold every worker: queued + running count toward the cap.
+    // Before quota: a capped tap is rejected without burning hourly downloads.
     if !acquire_user_slot(&state, user_id).await {
         respond(
             bot,
@@ -1028,6 +1037,7 @@ async fn run_audio(
 
     // Singleflight: an identical download already running serves this tap.
     // Waiters hold no worker and no user slot; the leader fans the file out.
+    // Before quota: deduped waiters consume nothing.
     let flight_key = (
         session.url_hash.clone(),
         "audio".to_owned(),
@@ -1039,11 +1049,19 @@ async fn run_audio(
         return;
     }
 
+    if let Err(e) = state.limiter.check_and_consume(user_id).await {
+        release_user_slot(&state, user_id).await;
+        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
+        respond(bot, chat, e).await;
+        return;
+    }
+
     // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
     let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state).await else {
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
+        let _ = state.limiter.refund(user_id).await;
         fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
         return;
     };
@@ -1067,6 +1085,7 @@ async fn run_audio(
         state.downloads.lock().await.remove(&session_id);
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
+        let _ = state.limiter.refund(user_id).await;
         fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
         return;
     };
