@@ -60,25 +60,49 @@ async fn main() -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
     let state = telegram::AppState::new(config, cache, sessions, limiter, semaphore, http);
+    let notify_bot = bot.clone();
 
     let mut dispatcher = Dispatcher::builder(bot, telegram::schema())
-        .dependencies(dptree::deps![state])
+        .dependencies(dptree::deps![state.clone()])
         .enable_ctrlc_handler()
         .build();
 
-    // Graceful shutdown: SIGTERM stops polling; in-flight downloads are
-    // cancelled via their tokens when the process exits (120s grace in compose).
-    // Telegram queues updates during the gap — nothing is lost.
+    // Graceful shutdown: SIGINT/SIGTERM stops polling after waiters get a
+    // restart notice and download tokens are cancelled (120s grace in
+    // compose). Telegram queues updates during the gap — nothing is lost.
     tokio::select! {
         () = dispatcher.dispatch() => {},
-        res = tokio::signal::ctrl_c() => {
-            match res {
-                Ok(()) => tracing::info!("shutdown signal received"),
-                Err(e) => tracing::warn!("signal handler failed: {e}"),
-            }
+        () = shutdown_signal() => {
+            tracing::info!("shutdown signal received");
+            telegram::shutdown_notify(notify_bot, &state).await;
         }
     }
     Ok(())
+}
+
+/// SIGINT (Ctrl-C) plus SIGTERM (`docker stop` sends TERM; without this the
+/// process would die instantly with no notices sent).
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::warn!("SIGTERM handler failed ({e}); watching SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = term.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn init_logging() {
