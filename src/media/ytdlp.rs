@@ -5,6 +5,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
+use crate::i18n::Lang;
 use crate::media::url::{MediaUrl, Platform};
 
 /// Channel for download progress (0–100).
@@ -33,13 +34,13 @@ impl VideoQuality {
     }
 
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
         match self {
             Self::P360 => "360p",
             Self::P480 => "480p",
             Self::P720 => "720p",
             Self::P1080 => "1080p",
-            Self::Best => "Best",
+            Self::Best => crate::i18n::best_label(lang),
         }
     }
 
@@ -89,12 +90,12 @@ impl AudioQuality {
     }
 
     #[must_use]
-    pub fn label(self) -> &'static str {
+    pub fn label(self, lang: Lang) -> &'static str {
         match self {
             Self::K128 => "128 kbps",
             Self::K192 => "192 kbps",
             Self::K320 => "320 kbps",
-            Self::Best => "Best",
+            Self::Best => crate::i18n::best_label(lang),
         }
     }
 

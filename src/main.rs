@@ -1,8 +1,10 @@
 mod cache;
 mod config;
 mod error;
+mod i18n;
 mod limiter;
 mod media;
+mod prefs;
 mod session;
 mod telegram;
 #[cfg(test)]
@@ -17,6 +19,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use crate::cache::FileCache;
 use crate::config::Config;
 use crate::limiter::RateLimiter;
+use crate::prefs::UserPrefs;
 use crate::session::SessionStore;
 
 #[tokio::main]
@@ -43,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
     let limiter = RateLimiter::new(manager, config.rate_limit);
 
     let cache = FileCache::open(&config.db_path).await?;
+    let prefs = UserPrefs::open(&config.db_path).await?;
 
     let mut bot = Bot::new(config.bot_token.clone());
     if let Some(api_url) = &config.api_url {
@@ -59,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
         .build()?;
-    let state = telegram::AppState::new(config, cache, sessions, limiter, semaphore, http);
+    let state = telegram::AppState::new(config, cache, prefs, sessions, limiter, semaphore, http);
     let notify_bot = bot.clone();
 
     // Register menu commands + profile texts (idempotent, best-effort).

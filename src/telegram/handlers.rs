@@ -14,9 +14,11 @@ use tokio_util::sync::CancellationToken;
 use crate::cache::FileCache;
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::i18n::{self, Lang};
 use crate::limiter::RateLimiter;
 use crate::media::url;
 use crate::media::ytdlp::{self, AudioQuality, VideoQuality};
+use crate::prefs::UserPrefs;
 use crate::session::{SessionStore, StoredSession};
 use crate::telegram::keyboard::{self, format_bytes};
 
@@ -25,6 +27,7 @@ use crate::telegram::keyboard::{self, format_bytes};
 pub struct AppState {
     pub config: Config,
     pub cache: FileCache,
+    pub prefs: UserPrefs,
     pub sessions: SessionStore,
     pub limiter: RateLimiter,
     pub semaphore: Arc<tokio::sync::Semaphore>,
@@ -49,6 +52,7 @@ impl AppState {
     pub fn new(
         config: Config,
         cache: FileCache,
+        prefs: UserPrefs,
         sessions: SessionStore,
         limiter: RateLimiter,
         semaphore: Arc<tokio::sync::Semaphore>,
@@ -57,6 +61,7 @@ impl AppState {
         Self {
             config,
             cache,
+            prefs,
             sessions,
             limiter,
             semaphore,
@@ -77,17 +82,24 @@ pub type FlightKey = (String, String, String);
 /// One in-flight download shared by identical concurrent taps:
 /// the first tapper (leader) runs the pipeline, the rest (waiters) get the
 /// finished `file_id` fanned out to their chats. Pure in-memory, no Redis.
+/// Waiters carry their own language so fan-out notices match their locale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlightWaiter {
+    pub chat: ChatId,
+    pub lang: Lang,
+}
+
 #[derive(Clone, Default)]
-pub struct Flights(Arc<tokio::sync::Mutex<HashMap<FlightKey, Vec<ChatId>>>>);
+pub struct Flights(Arc<tokio::sync::Mutex<HashMap<FlightKey, Vec<FlightWaiter>>>>);
 
 impl Flights {
     /// Register interest in a download. Returns `true` for the leader (runs
     /// the pipeline), `false` for a waiter (waits for fan-out). Atomic under
     /// the map lock, so simultaneous taps elect exactly one leader.
-    pub async fn attach_or_lead(&self, key: &FlightKey, chat: ChatId) -> bool {
+    pub async fn attach_or_lead(&self, key: &FlightKey, chat: ChatId, lang: Lang) -> bool {
         let mut flights = self.0.lock().await;
         if let Some(waiters) = flights.get_mut(key) {
-            waiters.push(chat);
+            waiters.push(FlightWaiter { chat, lang });
             false
         } else {
             flights.insert(key.clone(), Vec::new());
@@ -98,7 +110,7 @@ impl Flights {
     /// Leader done: drop the entry and hand over waiter chats for fan-out.
     /// A tap arriving after this becomes a new leader (and normally hits the
     /// `file_id` cache instantly, since the leader caches before finishing).
-    pub async fn finish(&self, key: &FlightKey) -> Vec<ChatId> {
+    pub async fn finish(&self, key: &FlightKey) -> Vec<FlightWaiter> {
         self.0.lock().await.remove(key).unwrap_or_default()
     }
 }
@@ -115,6 +127,8 @@ pub enum Command {
     Help,
     #[command(description = "Show your current usage and limits.")]
     Usage,
+    #[command(description = "Change language / Сменить язык.")]
+    Language,
 }
 
 pub const BOT_DESCRIPTION: &str =
@@ -122,10 +136,8 @@ pub const BOT_DESCRIPTION: &str =
 pub const BOT_SHORT_DESCRIPTION: &str =
     "Send a link, get video or audio back. YouTube, TikTok, Instagram, X.";
 
-const WELCOME: &str =
-    "Send me a YouTube, TikTok, Instagram, or X link and I'll fetch the video or audio for you.";
-
 /// Max file size label from config: Local Bot API unlocks 2 GB, else 50 MB.
+/// Units stay untranslated (shared across locales).
 fn upload_limit_label(config: &Config) -> &'static str {
     if config.api_url.is_some() {
         "2 GB"
@@ -135,13 +147,27 @@ fn upload_limit_label(config: &Config) -> &'static str {
 }
 
 /// Help text built from live config (rate, concurrency, upload cap).
-fn help_text(config: &Config) -> String {
-    format!(
-        "Send a link → tap 🎬 Video or 🎵 Audio → pick quality.\n\nCommands:\n/start — welcome\n/help — this guide\n/usage — your current usage\n\nLimits: {} downloads/hour, {} at a time, {} max file size.",
+fn help_text(config: &Config, lang: Lang) -> String {
+    i18n::help(
+        lang,
         config.rate_limit,
         config.max_per_user,
-        upload_limit_label(config)
+        upload_limit_label(config),
     )
+}
+
+/// Resolve the chat language: explicit `/language` choice first,
+/// Telegram `language_code` guess on first run, English fallback.
+/// A prefs-backend failure never fails the request — it only logs.
+async fn resolve_lang(state: &AppState, user_id: u64, tg_code: Option<&str>) -> Lang {
+    match state.prefs.get(user_id).await {
+        Ok(Some(lang)) => lang,
+        Ok(None) => Lang::from_telegram_code(tg_code),
+        Err(e) => {
+            tracing::warn!("prefs lookup failed: {e}");
+            Lang::from_telegram_code(tg_code)
+        }
+    }
 }
 
 /// Human-readable duration: `45s`, `2m 5s`, `1h 3m`.
@@ -168,7 +194,7 @@ fn format_duration(secs: u64) -> String {
 
 /// User-facing usage snapshot: hourly quota + reset + slots + file cap.
 /// Read-only: never consumes rate-limit quota.
-async fn usage_text(state: &AppState, user_id: u64) -> String {
+async fn usage_text(state: &AppState, user_id: u64, lang: Lang) -> String {
     let slots = state
         .user_slots
         .lock()
@@ -179,22 +205,26 @@ async fn usage_text(state: &AppState, user_id: u64) -> String {
     match state.limiter.usage(user_id).await {
         Ok(u) => {
             let reset = if u.reset_in_secs == 0 {
-                "full quota".to_owned()
+                i18n::reset_full(lang).to_owned()
             } else {
                 format!("in {}", format_duration(u.reset_in_secs))
             };
-            format!(
-                "📊 Usage\n\nDownloads this hour: {}/{} used ({} left)\nReset: {reset}\nConcurrent downloads: {slots}/{}\nMax file size: {}",
-                u.used,
-                state.config.rate_limit,
-                u.remaining,
-                state.config.max_per_user,
-                upload_limit_label(&state.config)
+            i18n::usage_body(
+                lang,
+                &i18n::UsageView {
+                    used: u.used,
+                    limit: state.config.rate_limit,
+                    left: u.remaining,
+                    reset: &reset,
+                    slots,
+                    max_slots: state.config.max_per_user,
+                    upload: upload_limit_label(&state.config),
+                },
             )
         }
         Err(e) => {
             tracing::warn!("usage lookup failed: {e}");
-            "Could not load usage. Try again later.".to_owned()
+            i18n::usage_unavailable(lang).to_owned()
         }
     }
 }
@@ -223,16 +253,13 @@ pub async fn init_telegram(bot: &Bot) {
 
 /// Reply with the sender's usage, or a fallback when Telegram omits the
 /// sender (e.g. channel posts). Never attributes quota to a shared id.
-async fn reply_usage(bot: &Bot, msg: &Message, state: &AppState) -> Result<()> {
+async fn reply_usage(bot: &Bot, msg: &Message, state: &AppState, lang: Lang) -> Result<()> {
     let Some(user) = msg.from.as_ref() else {
-        bot.send_message(
-            msg.chat.id,
-            "Can't tell who sent that. Usage is available from your own account.",
-        )
-        .await?;
+        bot.send_message(msg.chat.id, i18n::usage_no_sender(lang))
+            .await?;
         return Ok(());
     };
-    bot.send_message(msg.chat.id, usage_text(state, user.id.0).await)
+    bot.send_message(msg.chat.id, usage_text(state, user.id.0, lang).await)
         .await?;
     Ok(())
 }
@@ -242,59 +269,68 @@ pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<(
     let Some(text) = msg.text() else {
         return Ok(());
     };
+    let text = text.to_owned();
+    // Language guess for first-run users; explicit `/language` choice wins.
+    let tg_code = msg.from.as_ref().and_then(|u| u.language_code.as_deref());
+    let user_id = msg.from.as_ref().map_or(0, |u| u.id.0);
+    let lang = resolve_lang(&state, user_id, tg_code).await;
 
-    if let Ok(cmd) = Command::parse(text, "fetchly") {
+    if let Ok(cmd) = Command::parse(&text, "fetchly") {
         match cmd {
             Command::Start => {
-                bot.send_message(msg.chat.id, WELCOME).await?;
+                bot.send_message(msg.chat.id, i18n::welcome(lang)).await?;
             }
             Command::Help => {
-                bot.send_message(msg.chat.id, help_text(&state.config))
+                bot.send_message(msg.chat.id, help_text(&state.config, lang))
                     .await?;
             }
             Command::Usage => {
-                reply_usage(&bot, &msg, &state).await?;
+                reply_usage(&bot, &msg, &state, lang).await?;
+            }
+            Command::Language => {
+                reply_language_picker(&bot, msg.chat.id).await?;
             }
         }
         return Ok(());
     }
-    // Also handle bare `/start`/`/help`/`/usage` with bot username suffix.
+    // Also handle bare `/start`/`/help`/`/usage`/`/language` with bot username suffix.
     if text.starts_with("/start") {
-        bot.send_message(msg.chat.id, WELCOME).await?;
+        bot.send_message(msg.chat.id, i18n::welcome(lang)).await?;
         return Ok(());
     }
     if text.starts_with("/help") {
-        bot.send_message(msg.chat.id, help_text(&state.config))
+        bot.send_message(msg.chat.id, help_text(&state.config, lang))
             .await?;
         return Ok(());
     }
     if text.starts_with("/usage") {
-        reply_usage(&bot, &msg, &state).await?;
+        reply_usage(&bot, &msg, &state, lang).await?;
+        return Ok(());
+    }
+    if text.starts_with("/language") {
+        reply_language_picker(&bot, msg.chat.id).await?;
         return Ok(());
     }
 
-    let Some(raw_url) = extract_url(text) else {
-        bot.send_message(
-            msg.chat.id,
-            "Send a link and I'll fetch it. /help for details.",
-        )
-        .await?;
+    let Some(raw_url) = extract_url(&text) else {
+        bot.send_message(msg.chat.id, i18n::send_link_hint(lang))
+            .await?;
         return Ok(());
     };
 
     let media = match url::parse(&raw_url) {
         Ok(m) => m,
         Err(e) => {
-            bot.send_message(msg.chat.id, e.user_message()).await?;
+            bot.send_message(msg.chat.id, e.user_message(lang)).await?;
             return Ok(());
         }
     };
 
-    let status = bot.send_message(msg.chat.id, "🔍 Resolving link…").await?;
+    let status = bot.send_message(msg.chat.id, i18n::resolving(lang)).await?;
     let meta = match ytdlp::resolve(&media).await {
         Ok(m) => m,
         Err(e) => {
-            bot.edit_message_text(msg.chat.id, status.id, e.user_message())
+            bot.edit_message_text(msg.chat.id, status.id, e.user_message(lang))
                 .await?;
             return Ok(());
         }
@@ -305,17 +341,25 @@ pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<(
         Ok(id) => id,
         Err(e) => {
             tracing::error!("session create failed: {e}");
-            bot.edit_message_text(msg.chat.id, status.id, e.user_message())
+            bot.edit_message_text(msg.chat.id, status.id, e.user_message(lang))
                 .await?;
             return Ok(());
         }
     };
 
-    let caption = keyboard::preview_text(&meta);
-    let markup = keyboard::preview_keyboard(&session_id);
+    let caption = keyboard::preview_text(&meta, lang);
+    let markup = keyboard::preview_keyboard(&session_id, lang);
     // Delete the "resolving" placeholder, then send the preview card.
     let _ = bot.delete_message(msg.chat.id, status.id).await;
     send_preview(&bot, msg.chat.id, &meta, &caption, markup, &state.http).await?;
+    Ok(())
+}
+
+/// `/language` picker: bilingual prompt with English/Русский buttons.
+async fn reply_language_picker(bot: &Bot, chat: ChatId) -> Result<()> {
+    bot.send_message(chat, i18n::language_prompt())
+        .reply_markup(keyboard::language_keyboard())
+        .await?;
     Ok(())
 }
 
@@ -384,10 +428,19 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
         return Ok(());
     };
     let user_id = q.from.id.0;
+    let tg_code = q.from.language_code.as_deref();
+
+    // `/language` picker taps carry no session: `lang:en` / `lang:ru`.
+    if let Some(code) = data.strip_prefix("lang:") {
+        handle_lang_tap(&bot, &state, &q, chat, msg_id, code, tg_code).await?;
+        return Ok(());
+    }
+
+    let lang = resolve_lang(&state, user_id, tg_code).await;
 
     let Some((kind, quality, session_id)) = crate::session::parse_callback(&data) else {
         bot.answer_callback_query(q.id)
-            .text("Outdated button. Send the link again.")
+            .text(i18n::outdated_button(lang))
             .await?;
         return Ok(());
     };
@@ -397,22 +450,24 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
         let token = state.downloads.lock().await.remove(&session_id);
         if let Some(t) = token {
             t.cancel();
-            bot.answer_callback_query(q.id).text("Cancelling…").await?;
+            bot.answer_callback_query(q.id)
+                .text(i18n::cancelling(lang))
+                .await?;
         } else {
             bot.answer_callback_query(q.id)
-                .text("Nothing to cancel.")
+                .text(i18n::nothing_to_cancel(lang))
                 .await?;
             let _ = state.sessions.delete(&session_id).await;
-            edit_preview_text(&bot, chat, msg_id, "Cancelled.").await;
+            edit_preview_text(&bot, chat, msg_id, i18n::cancelled(lang)).await;
         }
         return Ok(());
     }
 
     let Ok(session) = state.sessions.get(&session_id).await else {
         bot.answer_callback_query(q.id)
-            .text("Session expired. Send the link again.")
+            .text(i18n::session_expired(lang))
             .await?;
-        edit_preview_text(&bot, chat, msg_id, "Session expired. Send the link again.").await;
+        edit_preview_text(&bot, chat, msg_id, i18n::session_expired(lang)).await;
         return Ok(());
     };
 
@@ -423,6 +478,7 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
                 .reply_markup(keyboard::video_quality_keyboard(
                     &session.metadata,
                     &session_id,
+                    lang,
                 ))
                 .await?;
         }
@@ -432,13 +488,14 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
                 .reply_markup(keyboard::audio_quality_keyboard(
                     &session.metadata,
                     &session_id,
+                    lang,
                 ))
                 .await?;
         }
         ('v', code) => {
             let Some(quality) = VideoQuality::parse_code(code) else {
                 bot.answer_callback_query(q.id)
-                    .text("Unknown quality.")
+                    .text(i18n::unknown_quality(lang))
                     .await?;
                 return Ok(());
             };
@@ -446,23 +503,53 @@ pub async fn handle_callback(bot: Bot, q: CallbackQuery, state: AppState) -> Res
             // Detached: the chat's update queue must stay live for ❌ taps
             // while the multi-minute pipeline runs (see fix 3 notes).
             tokio::spawn(run_video(
-                bot, chat, msg_id, user_id, session_id, session, quality, state,
+                bot, chat, msg_id, user_id, session_id, session, quality, state, lang,
             ));
         }
         ('a', code) => {
             let Some(quality) = AudioQuality::parse_code(code) else {
                 bot.answer_callback_query(q.id)
-                    .text("Unknown quality.")
+                    .text(i18n::unknown_quality(lang))
                     .await?;
                 return Ok(());
             };
             bot.answer_callback_query(q.id).await?;
             tokio::spawn(run_audio(
-                bot, chat, msg_id, user_id, session_id, session, quality, state,
+                bot, chat, msg_id, user_id, session_id, session, quality, state, lang,
             ));
         }
         _ => {
             bot.answer_callback_query(q.id).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Record an explicit `/language` choice and confirm in the chosen language.
+/// Unknown codes are ignored (stale buttons). A prefs-backend failure answers
+/// with a generic error instead of silently keeping the old language.
+async fn handle_lang_tap(
+    bot: &Bot,
+    state: &AppState,
+    q: &CallbackQuery,
+    chat: ChatId,
+    msg_id: MessageId,
+    code: &str,
+    tg_code: Option<&str>,
+) -> Result<()> {
+    let Some(choice) = Lang::from_code(code) else {
+        return Ok(());
+    };
+    match state.prefs.set(q.from.id.0, choice).await {
+        Ok(()) => {
+            bot.answer_callback_query(q.id.clone()).await?;
+            edit_preview_text(bot, chat, msg_id, i18n::language_set(choice)).await;
+        }
+        Err(e) => {
+            tracing::warn!("prefs set failed: {e}");
+            bot.answer_callback_query(q.id.clone())
+                .text(i18n::error_generic(Lang::from_telegram_code(tg_code)))
+                .await?;
         }
     }
     Ok(())
@@ -535,8 +622,6 @@ async fn tag_downloaded_audio(
 /// Server (see `TELEGRAM_API_URL`). Checked before attempting a doomed upload.
 const STANDARD_UPLOAD_LIMIT: u64 = 50_000_000;
 
-const OVER_LIMIT_MSG: &str = "This file is over 50 MB, which exceeds the standard Bot API upload limit. Pick a lower quality, or set up a Local Bot API Server for files up to 2 GB.";
-
 async fn exceeds_standard_limit(path: &std::path::Path) -> bool {
     tokio::fs::metadata(path)
         .await
@@ -546,11 +631,11 @@ async fn exceeds_standard_limit(path: &std::path::Path) -> bool {
 /// Map an upload failure to user text. A 413 from Telegram means the file
 /// passed our 2 GB guard but exceeds the 50 MB standard-API cap (e.g. the
 /// size estimate was off or the limit check was bypassed by cache racing).
-fn upload_error_message(raw: &str) -> String {
+fn upload_error_message(raw: &str, lang: Lang) -> String {
     if raw.to_lowercase().contains("too large") {
-        OVER_LIMIT_MSG.to_owned()
+        i18n::over_limit(lang).to_owned()
     } else {
-        Error::Telegram(raw.to_owned()).user_message()
+        Error::Telegram(raw.to_owned()).user_message(lang)
     }
 }
 
@@ -573,29 +658,18 @@ async fn acquire_permit(
     chat: ChatId,
     origin_msg: MessageId,
     state: &AppState,
+    lang: Lang,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
     let parked = state.queued.fetch_add(1, Ordering::SeqCst);
     if parked >= state.config.max_queued {
         state.queued.fetch_sub(1, Ordering::SeqCst);
         tracing::warn!("waiter cap hit ({parked} parked); rejecting tap");
-        edit_preview_text(
-            bot,
-            chat,
-            origin_msg,
-            "🔥 Fetchly is busy right now. Try again in a bit.",
-        )
-        .await;
+        edit_preview_text(bot, chat, origin_msg, i18n::busy(lang)).await;
         return None;
     }
     if state.semaphore.available_permits() == 0 {
         tracing::info!("download queued (depth {})", parked + 1);
-        edit_preview_text(
-            bot,
-            chat,
-            origin_msg,
-            "⏳ Queued… your download starts automatically.",
-        )
-        .await;
+        edit_preview_text(bot, chat, origin_msg, i18n::queued(lang)).await;
     }
     let permit = state.semaphore.clone().acquire_owned().await.ok();
     state.queued.fetch_sub(1, Ordering::SeqCst);
@@ -638,19 +712,27 @@ where
 /// Best-effort restart notice to every queued/in-flight chat, then cancel all
 /// download tokens. Bounded by `NOTIFY_TIMEOUT_SECS`; send failures are
 /// logged, never fatal — shutdown must not hang on a dead network.
-const RESTART_MSG: &str =
-    "🔄 Fetchly is restarting. Your download was stopped — please resend your link in a minute.";
+///
+/// The notice is bilingual: shutdown has only chat ids, no user ids, so the
+/// per-user language is unresolvable here.
 const NOTIFY_TIMEOUT_SECS: u64 = 15;
+
+/// Bilingual restart notice (see [`shutdown_notify`]).
+fn restart_bilingual() -> String {
+    format!("{}\n{}", i18n::restart(Lang::En), i18n::restart(Lang::Ru))
+}
 
 pub async fn shutdown_notify(bot: Bot, state: &AppState) {
     let chats: HashSet<i64> = state.notify.lock().await.values().map(|c| c.0).collect();
     tracing::info!("shutdown: notifying {} chats", chats.len());
+    let notice = restart_bilingual();
     let sends = async {
         let mut set = tokio::task::JoinSet::new();
         for chat_id in chats {
             let bot = bot.clone();
+            let notice = notice.clone();
             set.spawn(async move {
-                if let Err(e) = bot.send_message(ChatId(chat_id), RESTART_MSG).await {
+                if let Err(e) = bot.send_message(ChatId(chat_id), notice).await {
                     tracing::warn!("restart notice to {chat_id} failed: {e}");
                 }
             });
@@ -700,20 +782,6 @@ async fn release_user_slot(state: &AppState, user_id: u64) {
     }
 }
 
-/// Note shown to a tapper attaching to an already-running identical download.
-/// Waiters hold no worker and no user slot; the leader fans the file out.
-const FLIGHT_WAIT_NOTE: &str = "⏳ Already downloading — I'll send it here when it's ready.";
-
-/// Leader gave up before producing a file (admission/progress failure):
-/// waiters must re-tap, the flight is gone.
-const FLIGHT_RETRY_NOTE: &str = "The download didn't start. Please tap the quality again.";
-
-/// Leader cancelled: waiters didn't cancel anything, say so plainly.
-const FLIGHT_CANCELLED_NOTE: &str = "The download was cancelled.";
-
-/// Fallback when the upload failed without a mappable message.
-const FLIGHT_FAILED_NOTE: &str = "Something went wrong. Try again later.";
-
 /// Leader done: unregister the flight and send the finished file to every
 /// attached waiter chat. Best-effort per chat; failures are logged.
 async fn fan_out_file(
@@ -724,7 +792,8 @@ async fn fan_out_file(
     title: &str,
     file_id: &str,
 ) {
-    for chat in state.flights.finish(key).await {
+    for waiter in state.flights.finish(key).await {
+        let chat = waiter.chat;
         let res = if format == "video" {
             bot.send_video(
                 chat,
@@ -749,10 +818,16 @@ async fn fan_out_file(
 }
 
 /// Leader failed or gave up: unregister the flight and notify waiter chats.
-async fn fan_out_notice(bot: &Bot, state: &AppState, key: &FlightKey, notice: &str) {
-    for chat in state.flights.finish(key).await {
-        if let Err(e) = bot.send_message(chat, notice).await {
-            tracing::warn!("singleflight notice to {chat} failed: {e}");
+/// Each waiter gets the notice in their own language.
+async fn fan_out_notice(
+    bot: &Bot,
+    state: &AppState,
+    key: &FlightKey,
+    notice: impl Fn(Lang) -> String,
+) {
+    for waiter in state.flights.finish(key).await {
+        if let Err(e) = bot.send_message(waiter.chat, notice(waiter.lang)).await {
+            tracing::warn!("singleflight notice to {} failed: {e}", waiter.chat);
         }
     }
 }
@@ -772,6 +847,7 @@ async fn run_video(
     session: StoredSession,
     quality: VideoQuality,
     state: AppState,
+    lang: Lang,
 ) {
     let quality_code = quality.as_str().to_owned();
 
@@ -783,7 +859,11 @@ async fn run_video(
     {
         let sent = bot
             .send_video(chat, InputFile::file_id(teloxide::types::FileId(file_id)))
-            .caption(format!("{}\n{}", session.metadata.title, quality.label()))
+            .caption(format!(
+                "{}\n{}",
+                session.metadata.title,
+                quality.label(lang)
+            ))
             .await;
         // A stale file_id (message deleted upstream) falls through to re-download.
         if sent.is_ok() {
@@ -800,6 +880,7 @@ async fn run_video(
             Error::TooManyConcurrent {
                 max: state.config.max_per_user,
             },
+            lang,
         )
         .await;
         return;
@@ -813,27 +894,33 @@ async fn run_video(
         "video".to_owned(),
         quality_code.clone(),
     );
-    if !state.flights.attach_or_lead(&flight_key, chat).await {
+    if !state.flights.attach_or_lead(&flight_key, chat, lang).await {
         release_user_slot(&state, user_id).await;
-        let _ = bot.send_message(chat, FLIGHT_WAIT_NOTE).await;
+        let _ = bot.send_message(chat, i18n::flight_wait(lang)).await;
         return;
     }
 
     if let Err(e) = state.limiter.check_and_consume(user_id).await {
         release_user_slot(&state, user_id).await;
-        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
-        respond(bot, chat, e).await;
+        fan_out_notice(&bot, &state, &flight_key, |l| {
+            i18n::flight_retry(l).to_owned()
+        })
+        .await;
+        respond(bot, chat, e, lang).await;
         return;
     }
 
     // Queue when all workers are busy.
     // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
-    let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state).await else {
+    let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state, lang).await else {
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
         let _ = state.limiter.refund(user_id).await;
-        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
+        fan_out_notice(&bot, &state, &flight_key, |l| {
+            i18n::flight_retry(l).to_owned()
+        })
+        .await;
         return;
     };
 
@@ -849,15 +936,18 @@ async fn run_video(
         .insert(session_id.clone(), cancel.clone());
 
     let progress_msg = bot
-        .send_message(chat, "⬇️ Downloading ░░░░░░░░░░ 0%")
-        .reply_markup(keyboard::cancel_keyboard(&session_id))
+        .send_message(chat, i18n::downloading_zero(lang))
+        .reply_markup(keyboard::cancel_keyboard(&session_id, lang))
         .await;
     let Ok(progress_msg) = progress_msg else {
         state.downloads.lock().await.remove(&session_id);
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
         let _ = state.limiter.refund(user_id).await;
-        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
+        fan_out_notice(&bot, &state, &flight_key, |l| {
+            i18n::flight_retry(l).to_owned()
+        })
+        .await;
         return;
     };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
@@ -874,7 +964,7 @@ async fn run_video(
         bot.clone(),
         chat,
         progress_msg.id,
-        "⬇️ Downloading",
+        i18n::downloading_prefix(lang),
         100,
     );
 
@@ -894,25 +984,31 @@ async fn run_video(
     match download {
         Err(Error::Cancelled) => {
             let _ = bot
-                .edit_message_text(chat, progress_msg.id, "Cancelled.")
+                .edit_message_text(chat, progress_msg.id, i18n::cancelled(lang))
                 .await;
             cleanup(&work_dir).await;
-            fan_out_notice(&bot, &state, &flight_key, FLIGHT_CANCELLED_NOTE).await;
+            fan_out_notice(&bot, &state, &flight_key, |l| {
+                i18n::flight_cancelled(l).to_owned()
+            })
+            .await;
         }
         Err(e) => {
             tracing::warn!("video download failed: {e}");
-            let text = e.user_message();
+            let text = e.user_message(lang);
             let _ = bot.edit_message_text(chat, progress_msg.id, &text).await;
             cleanup(&work_dir).await;
-            fan_out_notice(&bot, &state, &flight_key, &text).await;
+            fan_out_notice(&bot, &state, &flight_key, |l| e.user_message(l)).await;
         }
         Ok(path) => {
             if exceeds_standard_limit(&path).await && state.config.api_url.is_none() {
                 let _ = bot
-                    .edit_message_text(chat, progress_msg.id, OVER_LIMIT_MSG)
+                    .edit_message_text(chat, progress_msg.id, i18n::over_limit(lang))
                     .await;
                 cleanup(&work_dir).await;
-                fan_out_notice(&bot, &state, &flight_key, OVER_LIMIT_MSG).await;
+                fan_out_notice(&bot, &state, &flight_key, |l| {
+                    i18n::over_limit(l).to_owned()
+                })
+                .await;
                 return;
             }
             let file_id = upload_video(
@@ -923,6 +1019,7 @@ async fn run_video(
                 &session,
                 quality,
                 &state,
+                lang,
             )
             .await;
             cleanup(&work_dir).await;
@@ -939,7 +1036,10 @@ async fn run_video(
                     .await;
                 }
                 None => {
-                    fan_out_notice(&bot, &state, &flight_key, FLIGHT_FAILED_NOTE).await;
+                    fan_out_notice(&bot, &state, &flight_key, |l| {
+                        i18n::flight_failed(l).to_owned()
+                    })
+                    .await;
                 }
             }
         }
@@ -948,6 +1048,7 @@ async fn run_video(
 
 /// Upload a finished video file, cache its `file_id`.
 /// Returns the `file_id` on success so the singleflight leader can fan it out.
+#[allow(clippy::too_many_arguments)]
 async fn upload_video(
     bot: &Bot,
     chat: ChatId,
@@ -956,12 +1057,13 @@ async fn upload_video(
     session: &StoredSession,
     quality: VideoQuality,
     state: &AppState,
+    lang: Lang,
 ) -> Option<String> {
-    progress_msg_update(bot, chat, progress_msg, "🔄 Uploading…").await;
+    progress_msg_update(bot, chat, progress_msg, i18n::uploading(lang)).await;
     let caption = format!(
         "{}\n{} · {}",
         session.metadata.title,
-        quality.label(),
+        quality.label(lang),
         session.metadata.platform.as_str()
     );
     match bot
@@ -983,7 +1085,11 @@ async fn upload_video(
         Err(e) => {
             tracing::warn!("send_video failed: {e}");
             let _ = bot
-                .edit_message_text(chat, progress_msg, upload_error_message(&e.to_string()))
+                .edit_message_text(
+                    chat,
+                    progress_msg,
+                    upload_error_message(&e.to_string(), lang),
+                )
                 .await;
             None
         }
@@ -1004,6 +1110,7 @@ async fn run_audio(
     session: StoredSession,
     quality: AudioQuality,
     state: AppState,
+    lang: Lang,
 ) {
     let quality_code = quality.as_str().to_owned();
 
@@ -1030,6 +1137,7 @@ async fn run_audio(
             Error::TooManyConcurrent {
                 max: state.config.max_per_user,
             },
+            lang,
         )
         .await;
         return;
@@ -1043,26 +1151,32 @@ async fn run_audio(
         "audio".to_owned(),
         quality_code.clone(),
     );
-    if !state.flights.attach_or_lead(&flight_key, chat).await {
+    if !state.flights.attach_or_lead(&flight_key, chat, lang).await {
         release_user_slot(&state, user_id).await;
-        let _ = bot.send_message(chat, FLIGHT_WAIT_NOTE).await;
+        let _ = bot.send_message(chat, i18n::flight_wait(lang)).await;
         return;
     }
 
     if let Err(e) = state.limiter.check_and_consume(user_id).await {
         release_user_slot(&state, user_id).await;
-        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
-        respond(bot, chat, e).await;
+        fan_out_notice(&bot, &state, &flight_key, |l| {
+            i18n::flight_retry(l).to_owned()
+        })
+        .await;
+        respond(bot, chat, e, lang).await;
         return;
     }
 
     // Register for shutdown notices first: parked waiters are invisible otherwise.
     state.notify.lock().await.insert(session_id.clone(), chat);
-    let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state).await else {
+    let Some(_permit) = acquire_permit(&bot, chat, origin_msg, &state, lang).await else {
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
         let _ = state.limiter.refund(user_id).await;
-        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
+        fan_out_notice(&bot, &state, &flight_key, |l| {
+            i18n::flight_retry(l).to_owned()
+        })
+        .await;
         return;
     };
 
@@ -1078,15 +1192,18 @@ async fn run_audio(
         .insert(session_id.clone(), cancel.clone());
 
     let progress_msg = bot
-        .send_message(chat, "⬇️ Downloading ░░░░░░░░░░ 0%")
-        .reply_markup(keyboard::cancel_keyboard(&session_id))
+        .send_message(chat, i18n::downloading_zero(lang))
+        .reply_markup(keyboard::cancel_keyboard(&session_id, lang))
         .await;
     let Ok(progress_msg) = progress_msg else {
         state.downloads.lock().await.remove(&session_id);
         state.notify.lock().await.remove(&session_id);
         release_user_slot(&state, user_id).await;
         let _ = state.limiter.refund(user_id).await;
-        fan_out_notice(&bot, &state, &flight_key, FLIGHT_RETRY_NOTE).await;
+        fan_out_notice(&bot, &state, &flight_key, |l| {
+            i18n::flight_retry(l).to_owned()
+        })
+        .await;
         return;
     };
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u8>();
@@ -1099,8 +1216,14 @@ async fn run_audio(
         url: session.url.clone(),
     };
 
-    let progress_task =
-        spawn_progress_forwarder(rx, bot.clone(), chat, progress_msg.id, "⬇️ Downloading", 80);
+    let progress_task = spawn_progress_forwarder(
+        rx,
+        bot.clone(),
+        chat,
+        progress_msg.id,
+        i18n::downloading_prefix(lang),
+        80,
+    );
 
     let download = with_deadline(
         deadline,
@@ -1115,7 +1238,7 @@ async fn run_audio(
     let result: Result<std::path::PathBuf> = match download {
         Err(e) => Err(e),
         Ok(src) => {
-            progress_msg_update(&bot, chat, progress_msg.id, "🔄 Converting…").await;
+            progress_msg_update(&bot, chat, progress_msg.id, i18n::converting(lang)).await;
             if let Err(e) = with_deadline(
                 deadline,
                 timeout_secs,
@@ -1138,25 +1261,31 @@ async fn run_audio(
     match result {
         Err(Error::Cancelled) => {
             let _ = bot
-                .edit_message_text(chat, progress_msg.id, "Cancelled.")
+                .edit_message_text(chat, progress_msg.id, i18n::cancelled(lang))
                 .await;
             cleanup(&work_dir).await;
-            fan_out_notice(&bot, &state, &flight_key, FLIGHT_CANCELLED_NOTE).await;
+            fan_out_notice(&bot, &state, &flight_key, |l| {
+                i18n::flight_cancelled(l).to_owned()
+            })
+            .await;
         }
         Err(e) => {
             tracing::warn!("audio pipeline failed: {e}");
-            let text = e.user_message();
+            let text = e.user_message(lang);
             let _ = bot.edit_message_text(chat, progress_msg.id, &text).await;
             cleanup(&work_dir).await;
-            fan_out_notice(&bot, &state, &flight_key, &text).await;
+            fan_out_notice(&bot, &state, &flight_key, |l| e.user_message(l)).await;
         }
         Ok(path) => {
             if exceeds_standard_limit(&path).await && state.config.api_url.is_none() {
                 let _ = bot
-                    .edit_message_text(chat, progress_msg.id, OVER_LIMIT_MSG)
+                    .edit_message_text(chat, progress_msg.id, i18n::over_limit(lang))
                     .await;
                 cleanup(&work_dir).await;
-                fan_out_notice(&bot, &state, &flight_key, OVER_LIMIT_MSG).await;
+                fan_out_notice(&bot, &state, &flight_key, |l| {
+                    i18n::over_limit(l).to_owned()
+                })
+                .await;
                 return;
             }
             let file_id = upload_audio(
@@ -1167,6 +1296,7 @@ async fn run_audio(
                 &session,
                 quality,
                 &state,
+                lang,
             )
             .await;
             cleanup(&work_dir).await;
@@ -1183,7 +1313,10 @@ async fn run_audio(
                     .await;
                 }
                 None => {
-                    fan_out_notice(&bot, &state, &flight_key, FLIGHT_FAILED_NOTE).await;
+                    fan_out_notice(&bot, &state, &flight_key, |l| {
+                        i18n::flight_failed(l).to_owned()
+                    })
+                    .await;
                 }
             }
         }
@@ -1192,6 +1325,7 @@ async fn run_audio(
 
 /// Upload a finished `MP3`, cache its `file_id`, and retire the progress message.
 /// Returns the `file_id` on success so the singleflight leader can fan it out.
+#[allow(clippy::too_many_arguments)]
 async fn upload_audio(
     bot: &Bot,
     chat: ChatId,
@@ -1200,8 +1334,9 @@ async fn upload_audio(
     session: &StoredSession,
     quality: AudioQuality,
     state: &AppState,
+    lang: Lang,
 ) -> Option<String> {
-    progress_msg_update(bot, chat, progress_msg, "⬆️ Uploading…").await;
+    progress_msg_update(bot, chat, progress_msg, i18n::uploading_audio(lang)).await;
     let mut req = bot
         .send_audio(chat, InputFile::file(path.to_owned()))
         .title(session.metadata.title.clone());
@@ -1230,28 +1365,29 @@ async fn upload_audio(
         Err(e) => {
             tracing::warn!("send_audio failed: {e}");
             let _ = bot
-                .edit_message_text(chat, progress_msg, upload_error_message(&e.to_string()))
+                .edit_message_text(
+                    chat,
+                    progress_msg,
+                    upload_error_message(&e.to_string(), lang),
+                )
                 .await;
             None
         }
     }
 }
 
-async fn respond(bot: Bot, chat: ChatId, e: Error) {
+async fn respond(bot: Bot, chat: ChatId, e: Error, lang: Lang) {
     match e {
         Error::RateLimited {
             retry_in_secs,
             remaining: _,
         } => {
             let _ = bot
-                .send_message(
-                    chat,
-                    format!("Too many requests. Try again in {retry_in_secs} seconds."),
-                )
+                .send_message(chat, i18n::rate_limited(lang, retry_in_secs))
                 .await;
         }
         other => {
-            let _ = bot.send_message(chat, other.user_message()).await;
+            let _ = bot.send_message(chat, other.user_message(lang)).await;
         }
     }
 }
@@ -1322,14 +1458,16 @@ mod tests {
 
     #[test]
     fn upload_error_maps_413_to_limit_advice() {
-        assert_eq!(
-            upload_error_message("A Telegram's error: Request Entity Too Large"),
-            OVER_LIMIT_MSG
-        );
-        assert_eq!(
-            upload_error_message("Bad Request: chat not found"),
-            "Something went wrong. Try again later."
-        );
+        for lang in [Lang::En, Lang::Ru] {
+            assert_eq!(
+                upload_error_message("A Telegram's error: Request Entity Too Large", lang),
+                i18n::over_limit(lang)
+            );
+            assert_eq!(
+                upload_error_message("Bad Request: chat not found", lang),
+                i18n::error_generic(lang)
+            );
+        }
     }
 
     #[tokio::test]
@@ -1382,6 +1520,7 @@ mod tests {
         let state = AppState::new(
             config,
             FileCache::open_in_memory().expect("cache"),
+            crate::prefs::UserPrefs::open_in_memory().expect("prefs"),
             SessionStore::new(t.manager.clone()),
             RateLimiter::new(t.manager.clone(), 20),
             Arc::new(tokio::sync::Semaphore::new(1)),
@@ -1417,6 +1556,7 @@ mod tests {
         let state = AppState::new(
             config,
             FileCache::open_in_memory().expect("cache"),
+            crate::prefs::UserPrefs::open_in_memory().expect("prefs"),
             SessionStore::new(t.manager.clone()),
             RateLimiter::new(t.manager.clone(), 20),
             Arc::new(tokio::sync::Semaphore::new(2)),
@@ -1424,7 +1564,7 @@ mod tests {
         );
         // Free permits: no Telegram calls, pure admission accounting.
         let bot = Bot::new("test-token");
-        let permit = acquire_permit(&bot, ChatId(1), MessageId(1), &state).await;
+        let permit = acquire_permit(&bot, ChatId(1), MessageId(1), &state, Lang::En).await;
         assert!(permit.is_some());
         assert_eq!(state.queued.load(Ordering::SeqCst), 0);
         drop(permit);
@@ -1433,17 +1573,20 @@ mod tests {
     #[test]
     fn menu_commands_match_handlers() {
         let cmds = Command::bot_commands();
-        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds.len(), 4);
         assert_eq!(cmds[0].command.trim_start_matches('/'), "start");
         assert_eq!(cmds[1].command.trim_start_matches('/'), "help");
         assert_eq!(cmds[2].command.trim_start_matches('/'), "usage");
+        assert_eq!(cmds[3].command.trim_start_matches('/'), "language");
         assert!(!cmds[0].description.is_empty());
         assert!(!cmds[1].description.is_empty());
         assert!(!cmds[2].description.is_empty());
+        assert!(!cmds[3].description.is_empty());
         let text = Command::descriptions().to_string();
         assert!(text.contains("/start"));
         assert!(text.contains("/help"));
         assert!(text.contains("/usage"));
+        assert!(text.contains("/language"));
     }
 
     #[test]
@@ -1460,23 +1603,35 @@ mod tests {
     async fn flight_first_tapper_leads_rest_wait() {
         let flights = Flights::default();
         let key = flight_key("hash", "video", "720");
-        assert!(flights.attach_or_lead(&key, ChatId(1)).await);
-        assert!(!flights.attach_or_lead(&key, ChatId(2)).await);
+        assert!(flights.attach_or_lead(&key, ChatId(1), Lang::En).await);
+        assert!(!flights.attach_or_lead(&key, ChatId(2), Lang::Ru).await);
         // Different qualities still download independently.
         let other = flight_key("hash", "video", "1080");
-        assert!(flights.attach_or_lead(&other, ChatId(3)).await);
+        assert!(flights.attach_or_lead(&other, ChatId(3), Lang::En).await);
     }
 
     #[tokio::test]
     async fn flight_finish_hands_over_waiters_and_releases_key() {
         let flights = Flights::default();
         let key = flight_key("hash", "audio", "320");
-        assert!(flights.attach_or_lead(&key, ChatId(1)).await);
-        assert!(!flights.attach_or_lead(&key, ChatId(2)).await);
-        assert!(!flights.attach_or_lead(&key, ChatId(3)).await);
-        assert_eq!(flights.finish(&key).await, vec![ChatId(2), ChatId(3)]);
+        assert!(flights.attach_or_lead(&key, ChatId(1), Lang::En).await);
+        assert!(!flights.attach_or_lead(&key, ChatId(2), Lang::Ru).await);
+        assert!(!flights.attach_or_lead(&key, ChatId(3), Lang::En).await);
+        assert_eq!(
+            flights.finish(&key).await,
+            vec![
+                FlightWaiter {
+                    chat: ChatId(2),
+                    lang: Lang::Ru
+                },
+                FlightWaiter {
+                    chat: ChatId(3),
+                    lang: Lang::En
+                },
+            ]
+        );
         // Key released: the next tapper leads again.
-        assert!(flights.attach_or_lead(&key, ChatId(4)).await);
+        assert!(flights.attach_or_lead(&key, ChatId(4), Lang::En).await);
     }
 
     #[tokio::test]
@@ -1487,7 +1642,7 @@ mod tests {
         for i in 0..10 {
             let registry = flights.clone();
             let tapped = key.clone();
-            set.spawn(async move { registry.attach_or_lead(&tapped, ChatId(i)).await });
+            set.spawn(async move { registry.attach_or_lead(&tapped, ChatId(i), Lang::En).await });
         }
         let mut leaders = 0;
         while let Some(res) = set.join_next().await {
@@ -1516,16 +1671,21 @@ mod tests {
 
     #[test]
     fn help_reflects_upload_cap() {
-        let std = help_text(&test_config(20, 2, None));
+        let std = help_text(&test_config(20, 2, None), Lang::En);
         assert!(std.contains("20 downloads/hour"), "{std}");
         assert!(std.contains("2 at a time"), "{std}");
         assert!(std.contains("50 MB max file size"), "{std}");
         assert!(std.contains("/usage"), "{std}");
+        assert!(std.contains("/language"), "{std}");
 
-        let local = help_text(&test_config(5, 1, Some("http://botapi:8081")));
+        let local = help_text(&test_config(5, 1, Some("http://botapi:8081")), Lang::En);
         assert!(local.contains("5 downloads/hour"), "{local}");
         assert!(local.contains("1 at a time"), "{local}");
         assert!(local.contains("2 GB max file size"), "{local}");
+
+        let ru = help_text(&test_config(20, 2, None), Lang::Ru);
+        assert!(ru.contains("20 загрузок/час"), "{ru}");
+        assert!(ru.contains("/language"), "{ru}");
     }
 
     #[test]
@@ -1546,12 +1706,13 @@ mod tests {
         let state = AppState::new(
             test_config(20, 2, None),
             FileCache::open_in_memory().expect("cache"),
+            crate::prefs::UserPrefs::open_in_memory().expect("prefs"),
             SessionStore::new(t.manager.clone()),
             RateLimiter::new(t.manager.clone(), 20),
             Arc::new(tokio::sync::Semaphore::new(2)),
             reqwest::Client::new(),
         );
-        let fresh = usage_text(&state, 9001).await;
+        let fresh = usage_text(&state, 9001, Lang::En).await;
         assert!(fresh.contains("0/20 used (20 left)"), "{fresh}");
         assert!(fresh.contains("0/2"), "{fresh}");
         assert!(fresh.contains("50 MB"), "{fresh}");
@@ -1562,9 +1723,38 @@ mod tests {
             .await
             .expect("consume");
         state.user_slots.lock().await.insert(9001, 1);
-        let used = usage_text(&state, 9001).await;
+        let used = usage_text(&state, 9001, Lang::En).await;
         assert!(used.contains("1/20 used (19 left)"), "{used}");
         assert!(used.contains("1/2"), "{used}");
         assert!(used.contains("Reset: in "), "{used}");
+
+        let ru = usage_text(&state, 9001, Lang::Ru).await;
+        assert!(ru.contains("1/20"), "{ru}");
+        assert!(ru.contains("Сброс:"), "{ru}");
+    }
+
+    #[tokio::test]
+    async fn resolve_lang_prefers_explicit_choice() {
+        let Some(t) = crate::testutil::start_redis().await else {
+            return;
+        };
+        let state = AppState::new(
+            test_config(20, 2, None),
+            FileCache::open_in_memory().expect("cache"),
+            crate::prefs::UserPrefs::open_in_memory().expect("prefs"),
+            SessionStore::new(t.manager.clone()),
+            RateLimiter::new(t.manager.clone(), 20),
+            Arc::new(tokio::sync::Semaphore::new(2)),
+            reqwest::Client::new(),
+        );
+        // No row: Telegram guess wins.
+        assert_eq!(resolve_lang(&state, 4242, Some("ru-RU")).await, Lang::Ru);
+        assert_eq!(resolve_lang(&state, 4242, Some("en-US")).await, Lang::En);
+        assert_eq!(resolve_lang(&state, 4242, None).await, Lang::En);
+        // Explicit choice beats the guess both ways.
+        state.prefs.set(4242, Lang::En).await.expect("set");
+        assert_eq!(resolve_lang(&state, 4242, Some("ru-RU")).await, Lang::En);
+        state.prefs.set(4242, Lang::Ru).await.expect("set");
+        assert_eq!(resolve_lang(&state, 4242, Some("en-US")).await, Lang::Ru);
     }
 }
