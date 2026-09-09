@@ -24,6 +24,35 @@ impl RateLimiter {
         format!("fetchly:ratelimit:{user_id}")
     }
 
+    /// Read-only view of a user's current window. Never consumes quota.
+    /// Returns used count, remaining quota, and seconds until reset (0 = full quota).
+    pub async fn usage(&self, user_id: u64) -> Result<Usage> {
+        let mut conn = self.manager.clone();
+        let key = Self::key(user_id);
+        let count: Option<i64> = conn
+            .get(&key)
+            .await
+            .map_err(|e| Error::Limiter(e.to_string()))?;
+        let count = count.unwrap_or(0).max(0);
+        let max = i64::from(self.max_per_hour);
+        let used = u32::try_from(count.min(max)).unwrap_or(0);
+        let remaining = u32::try_from(max - count.min(max)).unwrap_or(0);
+        let reset_in_secs = if count > 0 {
+            let ttl: i64 = conn
+                .ttl(&key)
+                .await
+                .map_err(|e| Error::Limiter(e.to_string()))?;
+            u64::try_from(ttl).unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(Usage {
+            used,
+            remaining,
+            reset_in_secs,
+        })
+    }
+
     /// Consume one unit. On success returns remaining quota in the window.
     /// On exhaustion returns [`Error::RateLimited`] with TTL-based retry hint.
     pub async fn check_and_consume(&self, user_id: u64) -> Result<u32> {
@@ -55,6 +84,14 @@ impl RateLimiter {
     }
 }
 
+/// Snapshot of one user's rate-limit window (see [`RateLimiter::usage`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Usage {
+    pub used: u32,
+    pub remaining: u32,
+    pub reset_in_secs: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,6 +121,33 @@ mod tests {
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn usage_peeks_without_consuming() {
+        let Some(t) = crate::testutil::start_redis().await else {
+            return;
+        };
+        let limiter = RateLimiter::new(t.manager.clone(), 3);
+        let fresh = limiter.usage(3001).await.expect("peek");
+        assert_eq!(
+            fresh,
+            Usage {
+                used: 0,
+                remaining: 3,
+                reset_in_secs: 0,
+            }
+        );
+        limiter.check_and_consume(3001).await.expect("consume");
+        limiter.check_and_consume(3001).await.expect("consume");
+        let mid = limiter.usage(3001).await.expect("peek");
+        assert_eq!(mid.used, 2);
+        assert_eq!(mid.remaining, 1);
+        assert!(mid.reset_in_secs > 0 && mid.reset_in_secs <= 3600);
+        // Peek again: still 2 used, quota untouched.
+        let again = limiter.usage(3001).await.expect("peek");
+        assert_eq!(again.used, 2);
+        assert_eq!(again.remaining, 1);
     }
 
     #[tokio::test]
