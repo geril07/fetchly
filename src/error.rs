@@ -111,8 +111,8 @@ mod tests {
             ),
             (
                 Error::PrivateOrRestricted,
-                "This content is private or restricted.",
-                "Этот контент приватный или недоступен.",
+                "This content isn't public without a login, so I can't download it.",
+                "Этот контент не виден без входа в аккаунт, поэтому скачать его не получится.",
             ),
             (
                 Error::TooLarge,

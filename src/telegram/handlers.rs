@@ -345,6 +345,7 @@ pub async fn handle_message(bot: Bot, msg: Message, state: AppState) -> Result<(
     let meta = match ytdlp::resolve(&media).await {
         Ok(m) => m,
         Err(e) => {
+            tracing::warn!("resolve failed for {}: {e}", media.url);
             bot.edit_message_text(msg.chat.id, status.id, e.user_message(lang))
                 .await?;
             return Ok(());

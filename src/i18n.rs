@@ -421,8 +421,8 @@ pub fn error_unsupported(lang: Lang) -> &'static str {
 #[must_use]
 pub fn error_private(lang: Lang) -> &'static str {
     match lang {
-        Lang::En => "This content is private or restricted.",
-        Lang::Ru => "Этот контент приватный или недоступен.",
+        Lang::En => "This content isn't public without a login, so I can't download it.",
+        Lang::Ru => "Этот контент не виден без входа в аккаунт, поэтому скачать его не получится.",
     }
 }
 
