@@ -103,7 +103,7 @@ Second request for same URL+format+quality → instant `sendVideo`/`sendAudio` v
 | Condition              | Response                        |
 |-----------------------|---------------------------------|
 | Invalid/unsupported URL | "Unsupported link. Send a YouTube, TikTok, Instagram, or X URL." |
-| Private/restricted content | "This content is private or restricted." |
+| Private/restricted content | "This content isn't public without a login, so I can't download it." |
 | Download failure       | "Download failed. Try again later." |
 | File too large         | "File exceeds 2 GB limit. Try lower quality." |
 | Rate limit (platform)  | "Too many requests. Try again in {N} seconds." |

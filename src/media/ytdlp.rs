@@ -329,6 +329,9 @@ pub fn classify_ytdlp_error(stderr: &str) -> Error {
         || lower.contains("restricted")
         || lower.contains("unavailable")
         || lower.contains("not available")
+        // Instagram: age/audience restriction, invisible to anonymous fetches.
+        || lower.contains("available to everyone")
+        || lower.contains("certain audiences")
     {
         Error::PrivateOrRestricted
     } else if lower.contains("unsupported url") || lower.contains("no video formats found") {
@@ -581,6 +584,13 @@ mod tests {
         assert!(matches!(
             classify_ytdlp_error("ERROR: Unsupported URL"),
             Error::UnsupportedUrl
+        ));
+        assert!(matches!(
+            classify_ytdlp_error(
+                "ERROR: [Instagram] DfclnhwB784: This content isn't available to everyone: \
+                 It can't be seen by certain audiences."
+            ),
+            Error::PrivateOrRestricted
         ));
         assert!(matches!(
             classify_ytdlp_error("ERROR: boom"),
